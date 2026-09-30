@@ -1,0 +1,45 @@
+/*-------------------------------------------------------------+
+| ALGORITHM 4 FROM SLH-DSS (FIPS 205)                          |
+| Computes the base 2^b representation of input.               |
++-------------------------------------------------------------*/
+inline
+fn __base_b(
+  reg ptr u32[OUTLEN] baseb, // out: base-2^b digit values of the input 
+  reg ptr u8[INLEN] input    // byte string input
+) -> reg ptr u32[OUTLEN] // -> baseb
+{
+    reg u64 in;      // iterator over the input bytes
+    reg u32 bits;    // number of unprocessed bits of input
+    reg u32 total;   // buffer holding bits of input
+    reg u64 digit;   // one base-2^b value
+    reg u32 in_byte; // temporary variable
+
+    inline int out; // 
+
+    in = 0;    // 
+    bits = 0;  // 
+    total = 0; // 
+
+	// iterate over the output array
+    for out=0 to OUTLEN {
+		// gather enough bits of input to make one base-2^b digit
+		while (bits < LG_B) {
+			total <<= 8;               // shift left by eight bits to make place for one byte of input
+			in_byte = (32u) input[in]; // gather the next byte of input
+			total |= in_byte;          // insert the input byte into the buffer
+			in += 1;                   // one byte of input has been consumed
+			bits += 8;                 // one byte worth of bits has been added
+		}
+
+		// align and trim the bits of input
+        digit = (64u) total; // copy the buffer into digit
+		bits -= LG_B;        // there are 'bits' too many least-significant bits in the buffer at the moment
+    	_, _, _, _, _, digit = #SHR(digit, bits); // shift away the least-significant bits to align the input
+		digit &= (B-1); // mask away any bits from previous digits that were still to the left of the input
+
+		// write the digit value to the output array
+		baseb[out] = (32u) digit;
+    }
+
+    return baseb;
+}

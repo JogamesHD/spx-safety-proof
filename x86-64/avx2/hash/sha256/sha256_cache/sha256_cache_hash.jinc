@@ -1,0 +1,49 @@
+// OBS: This function does not have the INLEN parameter defined
+// It needs to be instantiated w/ namespaces 
+//_JogamesHD_ Precondition mainly derived from call of _blocks_0_ref_array
+#[safety =
+   {
+    requires = (SHA2_VERSION == 512) ? (is_arr_init(Hc, 0, 8*12) && is_arr_init(in, 0, INLEN))
+    : (is_arr_init(Hc, 0, 4*8) && is_arr_init(in, 0, INLEN)),
+    ensures = (SHA2_VERSION == 512) ? (is_arr_init(Hc, 0, 8*12) && is_arr_init(in, 0, INLEN) && is_arr_init(out, 0, 32))
+    : (is_arr_init(Hc, 0, 4*8) && is_arr_init(in, 0, INLEN) && is_arr_init(out, 0, 32))
+   }
+ ]
+fn sha256_cached(reg ptr u8[32] out, reg ptr u8[INLEN] in, reg ptr u8[96] Hc) -> reg ptr u8[32]
+{
+    reg u64 bits nblocks inlen offset;
+    stack u32[8] H;
+    reg ptr u32[8] Hp;
+    stack u32[32] sblocks;
+    reg ptr u32[32] sblocksp;
+
+    inline int i;
+
+    () = #spill(out);
+
+    bits = INLEN;
+    bits += SHA256_IN; // add the number of bytes that were processed to get the cached state Hc
+    bits <<= 3;
+    () = #spill(bits);
+    
+    Hp = H;
+
+    // set the state pointer to the cached state
+    for i=0 to 8 {
+        Hp[i] = Hc[:u32 i];
+    }
+
+    () = #spill(in);
+    Hp, offset = _blocks_0_ref_array(Hp, in);
+
+    () = #unspill(in, bits);
+    inlen = INLEN % 64;
+    sblocks, nblocks = __lastblocks_ref_array(in, inlen, offset, bits);
+    sblocksp = sblocks;
+    Hp, _ = _blocks_1_ref(Hp, sblocksp, nblocks);
+
+    () = #unspill(out);
+    H = Hp;
+    out = __store_ref_array(out, H);
+    return out;
+}

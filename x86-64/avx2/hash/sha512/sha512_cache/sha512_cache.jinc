@@ -1,0 +1,30 @@
+namespace sha256_firstblock {
+    param int INLEN = SHA256_IN;
+    require "../../sha256/sha256_array/sha256_array.jinc"
+    require "../../sha256/sha256_cache/sha256_cache_init.jinc"
+}
+
+namespace sha512_firstblock {
+    param int INLEN = SHA512_IN;
+    require "../sha512_array/sha512_array.jinc"
+    require "sha512_cache_init.jinc"
+}
+
+//_JogamesHD_ Preconditions comprised of precondition for sha256_initH_cache and sha512_initH_cache
+#[safety =
+   {
+    //_JogamesHD First the preconditions from sha256_initH_cache
+    requires = is_arr_init(pkseed, 0, SPX_N) && SPX_N <= SHA256_IN && SPX_N <= SHA512_IN &&
+    SHA512_IN % 8 == 0 && SHA256_IN % 8 == 0,
+    ensures = is_arr_init(Hc, 0, 8*12)
+   }
+ ]
+fn init_cache(reg ptr u8[96] Hc, reg ptr u8[SPX_N] pkseed) -> reg ptr u8[96]
+{
+    () = #spill(pkseed);
+    Hc = sha256_firstblock::sha256_initH_cache(Hc, pkseed);
+    () = #unspill(pkseed);
+    Hc = sha512_firstblock::sha512_initH_cache(Hc, pkseed);
+
+    return Hc;
+}

@@ -1,0 +1,173 @@
+//_JogamesHD_ Precondition is derived from preconditions of sha512_compress_avx2
+#[safety =
+   {
+    requires =
+    is_arr_init(_H, 0, 16*sha512_avx2::STATE_u128_SIZE) && is_arr_init(in, 0, INLEN),
+    //_JogamesHD_ Not important which namespaces is used in ensures-clause, as STATE_u128_SIZE has the
+    //_JogamesHD_ same value in sha512_compress_avx2 and sha512_compress_avx
+    ensures = is_arr_init(_H, 0, 16*sha512_avx::STATE_u128_SIZE) && offset == INLEN - (INLEN % 128) &&
+    is_arr_init(in, 0, INLEN)
+   }
+  ]
+fn _SHA512_blocks_0_ref_array(
+  reg ptr u64[8] _H,
+  reg ptr u8[INLEN] in
+) -> reg ptr u64[8], reg u64
+{
+  inline int t;
+  reg u64 offset;
+  stack u8[128] W1;
+  stack u8[256] W2;
+  reg ptr u64[80] Kp;
+  stack ptr u64[8] Hp;
+  reg ptr u64[8] H;
+  reg u64 inlen;
+
+  offset = 0;
+  inlen = INLEN;
+
+  Kp = SHA512_K;
+  () = #spill(Kp);
+  
+  Hp = _H;
+  H = Hp;
+
+  // consume as many pairs of consecutive input blocks using AVX2 as possible
+  if (INLEN >= 256) {
+    while(inlen >= 256) {
+      for t=0 to 32 {
+        W2[:u64 t] = in.[:u64 offset + 8*t];
+      }
+
+      () = #spill(in, offset, inlen);
+
+      H = sha512_avx2::sha512_compress_avx2(H, W2);
+
+      () = #unspill(in, offset, inlen);
+      offset += 256;
+      inlen -= 256;
+    }
+  }
+
+  // if one full block remains, consume using AVX
+  if (INLEN%256 >= 128) {
+    for t=0 to 16 {
+      W1[:u64 t] = in.[:u64 offset + 8*t];
+    }
+
+    () = #spill(in, offset, inlen);
+
+    H = sha512_avx::sha512_compress_avx(H, W1);
+
+    () = #unspill(in, offset, inlen);
+    offset += 128;
+  }
+
+  _H = H;
+  
+  return _H, offset;
+}
+
+//_JogamesHD_ inlen bytes are read from in
+//_JogamesHD_ The bound on inlen is necessary to prevent oob writes in sblocks
+//_JogamesHD_ _Question_ Do I need to make a statement about nblocks?
+#[safety =
+   {
+    requires = is_arr_init(in, offset, inlen) && inlen + offset <= INLEN &&
+    inlen <= 255,
+    ensures = is_arr_init(sblocks, 0, 8*32)
+   }
+  ]
+// OBS: This function does not have the INLEN parameter defined
+// It needs to be instantiated w/ namespaces
+inline 
+fn __SHA512_lastblocks_ref_array(reg ptr u8[INLEN] in, reg u64 inlen offset bits) -> stack u64[32], reg u64
+{
+  stack u64[32] sblocks;
+  inline int k;
+  reg u64 i j nblocks;
+  reg u8 v;
+
+  reg u64 index;
+
+  i = 0;
+
+  // Zero-fill the sblocks array
+  for k = 0 to 32 { sblocks[k] = i; }
+
+  // copy in to sblocks
+  while(i < inlen)
+  { 
+    index = offset; index += i;
+    v = in[index]; // v = (u8)[in + i];
+    sblocks[:u8 i] = v;
+    i += 1;
+  }
+
+  // set first byte after input to 0x80 
+  sblocks[:u8 i] = 0x80;
+
+  // check if one or two blocks are needed
+  if(inlen < 112) // 896 / 8 = 112
+  { j = (128-16); nblocks = 1; i = 127; }
+  else
+  { j = (256-16); nblocks = 2; i = 255; }
+
+  while(i >= j)
+  { sblocks[:u8 i] = (8u) bits;
+    bits >>= 8;
+    i -= 1;
+  }
+  
+  return sblocks, nblocks;
+}
+
+//_JogamesHD_ Preconditions are derived from the preconditions of sha512_compress_avx2 and __SHA512_lastblocks_ref_array
+#[safety =
+   {
+    requires =
+    is_arr_init(in, 0, INLEN) && INLEN%128 + ((INLEN/128)*128) <= INLEN, //_JogamesHD_ Might be redundant, but maybe useful for proofs
+    ensures = is_arr_init(out, 0, 8*8) && is_arr_init(in, 0, INLEN)
+   }
+  ]
+// OBS: This function does not have the INLEN parameter defined
+// It needs to be instantiated w/ namespaces 
+fn sha512(reg ptr u8[64] out, reg ptr u8[INLEN] in) -> reg ptr u8[64]
+{
+  reg u64 bits nblocks inlen offset;
+  stack u64[8] H;
+  reg ptr u64[8] Hp;
+  stack u64[32] sblocks;
+  reg ptr u64[32] sblocksp;
+  inline int i;
+
+  () = #spill(out);
+
+  bits = INLEN;
+  bits <<= 3;
+  () = #spill(bits);
+
+  H = __SHA512_initH_ref();
+  
+  () = #spill(in);
+  Hp = H;
+
+  for i=0 to INLEN/256 {
+    Hp = sha512_avx2::sha512_compress_avx2(Hp, in[i*256 : 256]);
+  }
+  for i=(INLEN/256)*2 to INLEN/128 {
+    Hp = sha512_avx::sha512_compress_avx(Hp, in[i*128 : 128]);
+  }
+  offset = (INLEN/128)*128;
+
+  () = #unspill(in, bits);
+  inlen = INLEN % 128;
+  sblocks, nblocks = __SHA512_lastblocks_ref_array(in, inlen, offset, bits);
+  sblocksp = sblocks;
+  Hp, _ = _SHA512_blocks_1_ref(Hp, sblocksp, nblocks);
+
+  () = #unspill(out);
+  H = Hp;
+  out = __SHA512_store_ref_array(out, H);
+  return out;
+}

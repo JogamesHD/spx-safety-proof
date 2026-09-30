@@ -1,0 +1,31 @@
+//_JogamesHD_ Precondition mainly derived from call of _blocks_0_ref_array
+#[safety =
+   {
+    requires = 
+    is_arr_init(pkseed, 0, SPX_N) && SPX_N <= SHA256_IN && //_JogamesHD_ To prevent oob array write in block
+    SHA256_IN % 8 == 0,
+    //_JogamesHD_ INLEN == SHA256_IN should be here because of _blocks_0_ref_array call, but probably not necessary
+    //_JogamesHD_ Since INLEN cannot be referenced here, it is easier to not have the condition
+    ensures = is_arr_init(Hc, 0, 4*8) && is_arr_init(pkseed, 0, SPX_N)
+   }
+ ]
+fn sha256_initH_cache(reg ptr u8[96] Hc, reg ptr u8[SPX_N] pkseed) -> reg ptr u8[96]
+{
+    stack u32[8] H;
+    stack u8[SHA256_IN] block;
+    reg ptr u32[8] Hp;
+    inline int i;
+
+    for i=0 to SHA256_IN/8 { block[:u64 i] = 0; }
+
+    for i=0 to SPX_N { block[i] = pkseed[i]; }
+
+    H = __initH_ref();
+    
+    Hp = H;
+    Hp, _ = _blocks_0_ref_array(Hp, block);
+
+    for i=0 to 8 { Hc[:u32 i] = Hp[i]; }
+
+    return Hc;
+}

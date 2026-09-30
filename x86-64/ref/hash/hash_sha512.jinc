@@ -1,0 +1,499 @@
+require "sha256/core_hash_sha256.jinc"
+require "sha512/core_hash_sha512.jinc"
+require "../adrs/adrs.jinc" // ADRS data structure
+
+require "../stdlib/memcpy/memcpy.jinc" // for copying SPX_N-byte strings
+
+// H_msg(R, PK.seed, PK.root, M) = MGF1-SHA-512(R || PK.seed || SHA-512(R || PK.seed || PK.root || M), m)
+fn H_msg(
+    reg ptr u8[SPX_M] out,    // output: buffer the result gets written to
+    reg ptr u8[SPX_N] r,      // message randomiser
+    reg ptr u8[SPX_N] pkseed, // PK.seed
+    reg ptr u8[SPX_N] pkroot, // PK.root
+    reg u64 ctx_ptr,          // context pointer
+    reg u64 ctx_len,          // context length
+    reg u64 msg_ptr,          // message pointer
+    reg u64 msg_len           // message length
+) -> reg ptr u8[SPX_M] // -> out
+{
+    () = #spill(out); // only needed at the end of the function
+
+    // stack variables
+    stack u8[3*SPX_N] buf; // buffer for the inner hash call
+    stack u8[2*SPX_N + SHA512_OUT + 4] seed; // buffer for the seed concatenated with a 4-byte counter
+    stack u8[((SPX_M + SHA512_OUT - 1) / SHA512_OUT) * SHA512_OUT] concat; // concatenated hash outputs
+    
+    inline int i;
+    inline int hash_nr;
+    
+    () = #spill(pkseed, pkroot); // resolves 'conflicting variables r and pkseed and pkroot'
+
+    // copy R into both buffers
+    buf[0 : SPX_N]  = __copy_nbytes(buf[0 : SPX_N],  r);
+    seed[0 : SPX_N] = __copy_nbytes(seed[0 : SPX_N], r);
+
+    // copy PK.seed into both buffers
+    () = #unspill(pkseed);
+    buf[SPX_N : SPX_N]  = __copy_nbytes(buf[SPX_N : SPX_N],  pkseed);
+    seed[SPX_N : SPX_N] = __copy_nbytes(seed[SPX_N : SPX_N], pkseed);
+
+    // copy PK.root into the inner buffer
+    () = #unspill(pkroot);
+    buf[2*SPX_N : SPX_N] = __copy_nbytes(buf[2*SPX_N : SPX_N], pkroot);
+
+    // compute the inner hash value = sha512(R || PK.seed || PK.root || M)
+    seed[2*SPX_N : SHA512_OUT] = sha512_mgf1_msg::__sha512_absorb(seed[2*SPX_N : SHA512_OUT], buf, ctx_ptr, ctx_len, msg_ptr, msg_len);
+
+    // set the first three of the four bytes of the counter to 0
+    // (for all approved parameter sets, we will never need > 255 hash output concatenations)
+    for i=0 to 3 { seed[2*SPX_N + SHA512_OUT + i] = 0; }
+    
+    // need ceil(SPX_M / SHA512_OUT) hashes of SHA512_OUT bytes each, to surpass at least SPX_M bytes
+    for hash_nr=0 to (SPX_M + SHA512_OUT - 1) / SHA512_OUT {
+        // set the last byte of 'seed' to the hash iteration counter
+        seed[2*SPX_N + SHA512_OUT + 3] = (8u) hash_nr;
+        
+        // compute sha512(seed), where seed includes the counter
+        concat[hash_nr*SHA512_OUT : SHA512_OUT] = sha512_mgf1_seed::__sha512(concat[hash_nr*SHA512_OUT : SHA512_OUT], seed);
+    }
+    
+    () = #unspill(out);
+    
+    // truncate the concatenated hash outputs to the correct length by copying only the first SPX_M bytes
+    for i=0 to SPX_M { out[i] = concat[i]; }
+    return out;
+}
+
+inline // inline wrapper that splits parameter live-ranges, to aid the Jasmin compiler
+fn __H_msg(
+    reg ptr u8[SPX_M] out,    // output: buffer the result gets written to
+    reg ptr u8[SPX_N] r,      // message randomiser
+    reg ptr u8[SPX_N] pkseed, // PK.seed
+    reg ptr u8[SPX_N] pkroot, // PK.root
+    reg u64 ctx_ptr,          // context pointer
+    reg u64 ctx_len,          // context length
+    reg u64 msg_ptr,          // message pointer
+    reg u64 msg_len           // message length
+) -> reg ptr u8[SPX_M] // -> out
+{
+    // split live-range of the input parameters into two segments
+    out = out; r = r; pkseed = pkseed; pkroot = pkroot; ctx_ptr = ctx_ptr; ctx_len = ctx_len; msg_ptr = msg_ptr; msg_len = msg_len;
+
+    out = H_msg(out, r, pkseed, pkroot, ctx_ptr, ctx_len, msg_ptr, msg_len);
+
+    // split live-range of the output parameters into two segments
+    out = out;
+
+    return out;
+}
+
+// PRF_msg(SK.prf, optrand, M) = Trunc_n(HMAC-SHA-512(SK.prf, optrand || M))
+fn PRF_msg(
+    reg ptr u8[SPX_N] out,     // output: buffer the result gets written to
+    reg ptr u8[SPX_N] skprf,   // SK.prf
+    reg ptr u8[SPX_N] optrand, // (optional) additional randomness
+    reg u64 ctx_ptr,           // context pointer
+    reg u64 ctx_len,           // context length
+    reg u64 msg_ptr,           // message pointer
+    reg u64 msg_len            // message length
+) -> reg ptr u8[SPX_N] // -> out
+{
+    () = #spill(out); // not needed until the end of the function
+
+    // register variables
+    reg u64 xor; // temporary variable for computing XORs
+
+    // stack variables
+    stack u8[SHA512_IN] key;               // buffer for the key
+    stack u8[SHA512_IN + SPX_N] ibuf;      // buffer for inner hash call
+    stack u8[SHA512_IN + SHA512_OUT] obuf; // buffer for outer hash call
+    stack u8[SHA512_OUT] hmac;
+    
+    inline int i;
+    
+    () = #spill(optrand); // resolves 'conflicting variables skprf and optrand'
+
+    // set key = SK.prf || 00..0
+    key[0 : SPX_N] = __copy_nbytes(key[0 : SPX_N], skprf); // first part of the key is SK.prf
+    for i=SPX_N to SHA512_IN { key[i] = 0; } // pad the rest of the key with zeroes
+
+    // compute ibuf = (key XOR ipad) eight bytes at a time
+    // reading a u64 word of a byte array incurs an Endianness byteswap,
+    // but we also write a u64 word to a byte array which undoes the byteswap
+    for i=0 to SHA512_IN/8 {
+        xor = 0x3636363636363636; // set ipad
+        xor ^= key[:u64 i];       // bitwise xor ipad with the key
+        ibuf[:u64 i] = xor;
+    }
+    // compute obuf = (key XOR opad) eight bytes at a time
+    // reading a u64 word of a byte array incurs an Endianness byteswap,
+    // but we also write a u64 word to a byte array which undoes the byteswap
+    for i=0 to SHA512_IN/8 {
+        xor = 0x5C5C5C5C5C5C5C5C; // set opad
+        xor ^= key[:u64 i];       // bitwise xor opad with the key
+        obuf[:u64 i] = xor;
+    }
+
+    // append optrand to ibuf
+    // i.e. ibuf = (key xor ipad) || optrand
+    () = #unspill(optrand);
+    ibuf[SHA512_IN : SPX_N] = __copy_nbytes(ibuf[SHA512_IN : SPX_N], optrand);
+
+    // compute inner = sha512((key xor ipad) || optrand || M)
+    obuf[SHA512_IN : SHA512_OUT] = sha512_hmac_inner::__sha512_absorb(obuf[SHA512_IN : SHA512_OUT], ibuf, ctx_ptr, ctx_len, msg_ptr, msg_len);
+
+    // compute hmac = sha512((key xor opad) || inner)
+    hmac = sha512_hmac_outer::__sha512(hmac, obuf);
+
+    () = #unspill(out);
+
+    // truncate hmac to the correct length by copying only the first SPX_N bytes
+    out = __copy_nbytes(out, hmac[0 : SPX_N]);
+    return out;
+}
+
+inline // inline wrapper that splits parameter live-ranges, to aid the Jasmin compiler
+fn __PRF_msg(
+    reg ptr u8[SPX_N] out,     // output: buffer the result gets written to
+    reg ptr u8[SPX_N] skprf,   // SK.prf
+    reg ptr u8[SPX_N] optrand, // (optional) additional randomness
+    reg u64 ctx_ptr,           // context pointer
+    reg u64 ctx_len,           // context length
+    reg u64 msg_ptr,           // message pointer
+    reg u64 msg_len            // message length
+) -> reg ptr u8[SPX_N] // -> out
+{
+    // split live-range of the input parameters into two segments
+    out = out; skprf = skprf; optrand = optrand; ctx_ptr = ctx_ptr; ctx_len = ctx_len; msg_ptr = msg_ptr; msg_len = msg_len;
+
+    out = PRF_msg(out, skprf, optrand, ctx_ptr, ctx_len, msg_ptr, msg_len);
+
+    // split live-range of the output parameters into two segments
+    out = out;
+
+    return out;
+}
+
+// PRF(PK.seed, SK.seed, ADRS) = Trunc_n(SHA-256(PK.seed || toByte(0,64-n) || ADRS^c || SK.seed))
+fn PRF(
+    reg ptr u8[SPX_N] out,    // output: buffer the result gets written to
+    reg ptr u8[SPX_N] pkseed, // PK.seed
+    reg ptr u8[SPX_N] skseed, // SK.seed
+    reg ptr u32[8] adrs       // ADRS
+) -> reg ptr u8[SPX_N] // -> out
+{
+    () = #spill(out); // not needed until the end of the function
+
+    // stack buffer that will contain the concatenated inputs
+    // buf = PK.seed || toByte(0,64-n) || ADRS^c || SK.seed
+    //     = SPX_N    + (64-SPX_N)      + 22      + SPX_N
+    //     =      SHA256_IN             + 22      + SPX_N
+    stack u8[SHA256_IN + 22 + SPX_N] buf;
+
+    // buffer for the output
+    stack u8[SHA256_OUT] digest;
+
+    inline int i;
+
+    // buf = PK.seed
+    buf[0 : SPX_N] = __copy_nbytes(buf[0 : SPX_N], pkseed);
+
+    // buf = PK.seed || zero-padding
+    for i=SPX_N to SHA256_IN { buf[i] = 0; } 
+
+    // buf = PK.seed || zero-padding || ADRS^c
+    buf[SHA256_IN : 22] = __adrs_compress(buf[SHA256_IN : 22], adrs);
+
+    // buf = PK.seed || zero-padding || ADRS^c || SK.seed
+    buf[SHA256_IN+22 : SPX_N] = __copy_nbytes(buf[SHA256_IN+22 : SPX_N], skseed);
+
+    // compute digest = sha256(PK.seed || zero-padding || ADRS^c || SK.seed)
+    digest = sha256_tl_1n::__sha256(digest, buf);
+
+    () = #unspill(out);
+
+    // truncate the digest to the correct length by copying only the first SPX_N bytes
+    out = __copy_nbytes(out, digest[0 : SPX_N]);
+    return out;
+}
+
+inline // inline wrapper that splits parameter live-ranges, to aid the Jasmin compiler
+fn __PRF(
+    reg ptr u8[SPX_N] out,    // output: buffer the result gets written to
+    reg ptr u8[SPX_N] pkseed, // PK.seed
+    reg ptr u8[SPX_N] skseed, // SK.seed
+    reg ptr u32[8] adrs       // ADRS
+) -> reg ptr u8[SPX_N] // -> out
+{
+    // split live-range of the input parameters into two segments
+    out = out; pkseed = pkseed; skseed = skseed; adrs = adrs;
+
+    out = PRF(out, pkseed, skseed, adrs);
+
+    // split live-range of the output parameters into two segments
+    out = out;
+
+    return out;
+}
+
+// F(PK.seed, ADRS, M_1) = Trunc_n(SHA-256(PK.seed || toByte(0,64-n) || ADRS^c || M_1))
+fn F(
+    reg ptr u8[SPX_N] out,    // both input and output (F is in-place)
+    reg ptr u8[SPX_N] pkseed, // PK.seed
+    reg ptr u32[8] adrs       // ADRS
+) -> reg ptr u8[SPX_N] // -> out
+{
+    () = #spill(out); // resolves 'conflicting variables out and pkseed'
+    
+    // stack buffer that will contain the concatenated inputs
+    // buf = PK.seed || toByte(0,64-n) || ADRS^c || M_1
+    //     = SPX_N    + (64-SPX_N)      + 22      + SPX_N
+    //     =      SHA256_IN             + 22      + SPX_N
+    stack u8[SHA256_IN + 22 + SPX_N] buf;
+
+    // buffer for the output
+    stack u8[SHA256_OUT] digest;
+
+    inline int i;
+
+    // buf = PK.seed
+    buf[0 : SPX_N] = __copy_nbytes(buf[0 : SPX_N], pkseed);
+
+    // buf = PK.seed || zero-padding
+    for i=SPX_N to SHA256_IN { buf[i] = 0; }
+
+    // buf = PK.seed || zero-padding || ADRS^c
+    buf[SHA256_IN : 22] = __adrs_compress(buf[SHA256_IN : 22], adrs);
+
+    // buf = PK.seed || zero-padding || ADRS^c || M_1
+    () = #unspill(out);
+    buf[SHA256_IN+22 : SPX_N] = __copy_nbytes(buf[SHA256_IN+22 : SPX_N], out);
+    () = #spill(out); // only needed again at the end of the function
+
+    // compute digest = sha256(PK.seed || zero-padding || ADRS^c || M_1)
+    digest = sha256_tl_1n::__sha256(digest, buf);
+
+    () = #unspill(out);
+
+    // truncate the digest to the correct length by copying only the first SPX_N bytes
+    out = __copy_nbytes(out, digest[0 : SPX_N]);
+    return out;
+}
+
+inline // inline wrapper that splits parameter live-ranges, to aid the Jasmin compiler
+fn __F(
+    reg ptr u8[SPX_N] out,    // both input and output (F is in-place)
+    reg ptr u8[SPX_N] pkseed, // PK.seed
+    reg ptr u32[8] adrs       // ADRS
+) -> reg ptr u8[SPX_N] // -> out
+{
+    // split live-range of the input parameters into two segments
+    out = out; pkseed = pkseed; adrs = adrs;
+
+    out = F(out, pkseed, adrs);
+
+    // split live-range of the output parameters into two segments
+    out = out;
+
+    return out;
+}
+
+// H(PK.seed, ADRS, M_2) = Trunc_n(SHA-512(PK.seed || toByte(0,128-n) || ADRS^c || M_2))
+fn H(
+    reg ptr u8[SPX_N] out,    // output: buffer the result gets written to
+    reg ptr u8[SPX_N] pkseed, // PK.seed
+    reg ptr u32[8] adrs,      // ADRS
+    reg ptr u8[SPX_N] in1,    // first part of the concatenation
+    reg ptr u8[SPX_N] in2     // second part of the concatenation
+) -> reg ptr u8[SPX_N] // -> out
+{
+    () = #spill(out); // not needed until the end of the function
+
+    // stack buffer that will contain the concatenated inputs
+    // buf = PK.seed || toByte(0,64-n) || ADRS^c || M_2     (for sha2-128)
+    //     = SPX_N    + (64-SPX_N)      + 22      + 2*SPX_N (for sha2-128)
+    //     =        ... (128-SPX_N) ...                     (for sha2-192 and sha2-256)
+    //     =       SHA512_IN              + 22      + 2*SPX_N (any case)
+    stack u8[SHA512_IN + 22 + 2*SPX_N] buf;
+
+    // buffer for the output
+    stack u8[SHA512_OUT] digest;
+
+    inline int i;
+
+    () = #spill(in1, in2); // resolves 'conflicting variables pkseed and in1 and in2'
+
+    // buf = PK.seed
+    buf[0 : SPX_N] = __copy_nbytes(buf[0 : SPX_N], pkseed);
+
+    // buf = PK.seed || zero-padding
+    for i=SPX_N to SHA512_IN { buf[i] = 0; } 
+
+    // buf = PK.seed || zero-padding || ADRS^c
+    buf[SHA512_IN : 22] = __adrs_compress(buf[SHA512_IN : 22], adrs);
+
+    // buf = PK.seed || zero-padding || ADRS^c || M_2
+    () = #unspill(in1);
+    buf[SHA512_IN+22 : SPX_N] = __copy_nbytes(buf[SHA512_IN+22 : SPX_N], in1);
+    () = #unspill(in2);
+    buf[SHA512_IN+22+SPX_N : SPX_N] = __copy_nbytes(buf[SHA512_IN+22+SPX_N : SPX_N], in2);
+
+    // compute digest = sha512(PK.seed || zero-padding || ADRS^c || M_2)
+    digest = sha512_tl_2n::__sha512(digest, buf);
+
+    () = #unspill(out);
+
+    // truncate the digest to the correct length by copying only the first SPX_N bytes
+    out = __copy_nbytes(out, digest[0 : SPX_N]);
+    return out;
+}
+
+inline // inline wrapper that splits parameter live-ranges, to aid the Jasmin compiler
+fn __H(
+    reg ptr u8[SPX_N] out,    // output: buffer the result gets written to
+    reg ptr u8[SPX_N] pkseed, // PK.seed
+    reg ptr u32[8] adrs,      // ADRS
+    reg ptr u8[SPX_N] in1,    // first part of the concatenation
+    reg ptr u8[SPX_N] in2     // second part of the concatenation
+) -> reg ptr u8[SPX_N] // -> out
+{
+    // split live-range of the input parameters into two segments
+    out = out; pkseed = pkseed; adrs = adrs; in1 = in1; in2 = in2;
+
+    out = H(out, pkseed, adrs, in1, in2);
+
+    // split live-range of the output parameters into two segments
+    out = out;
+
+    return out;
+}
+
+// T_len(PK.seed, ADRS, M_len) = Trunc_n(SHA-512(PK.seed || toByte(0,128-n) || ADRS^c || M_len))
+fn T_len(
+    reg ptr u8[SPX_N] out,           // output: buffer the result gets written to
+    reg ptr u8[SPX_N] pkseed,        // PK.seed
+    reg ptr u32[8] adrs,             // ADRS
+    reg ptr u8[SPX_LEN*SPX_N] chains // concatenation of all chain end values in a WOTS instance
+) -> reg ptr u8[SPX_N] // -> out
+{
+    () = #spill(out); // not needed until the end of the function
+
+    // stack buffer that will contain the concatenated inputs
+    // buf = PK.seed || toByte(0,64-n) || ADRS^c || M_len         (for sha2-128)
+    //     = SPX_N    + (64-SPX_N)      + 22      + SPX_LEN*SPX_N (for sha2-128)
+    //     =        ... (128-SPX_N) ...                           (for sha2-192 and sha2-256)
+    //     =       SHA512_IN              + 22      + SPX_LEN*SPX_N (any case)
+    stack u8[SHA512_IN + 22 + SPX_LEN*SPX_N] buf;
+
+    // buffer for the output
+    stack u8[SHA512_OUT] digest;
+
+    inline int i;
+
+    // buf = PK.seed
+    buf[0 : SPX_N] = __copy_nbytes(buf[0 : SPX_N], pkseed);
+
+    // buf = PK.seed || zero-padding
+    for i=SPX_N to SHA512_IN { buf[i] = 0; } 
+
+    // buf = PK.seed || zero-padding || ADRS^c
+    buf[SHA512_IN : 22] = __adrs_compress(buf[SHA512_IN : 22], adrs);
+
+    // buf = PK.seed || zero-padding || ADRS^c || M_len
+    for i=0 to SPX_LEN {
+        buf[SHA512_IN+22+i*SPX_N : SPX_N] = __copy_nbytes(buf[SHA512_IN+22+i*SPX_N : SPX_N], chains[i*SPX_N : SPX_N]);
+    }
+
+    // compute digest = sha512(PK.seed || zero-padding || ADRS^c || M_len)
+    digest = sha512_compress_wots::__sha512(digest, buf);
+
+    () = #unspill(out);
+
+    // truncate the message digest to the correct length by copying only the first SPX_N bytes
+    out = __copy_nbytes(out, digest[0 : SPX_N]);
+    return out;
+}
+
+inline // inline wrapper that splits parameter live-ranges, to aid the Jasmin compiler
+fn __T_len(
+    reg ptr u8[SPX_N] out,           // output: buffer the result gets written to
+    reg ptr u8[SPX_N] pkseed,        // PK.seed
+    reg ptr u32[8] adrs,             // ADRS
+    reg ptr u8[SPX_LEN*SPX_N] chains // concatenation of all chain end values in a WOTS instance
+) -> reg ptr u8[SPX_N] // -> out
+{
+    // split live-range of the input parameters into two segments
+    out = out; pkseed = pkseed; adrs = adrs; chains = chains;
+
+    out = T_len(out, pkseed, adrs, chains);
+
+    // split live-range of the output parameters into two segments
+    out = out;
+
+    return out;
+}
+
+// T_k(PK.seed, ADRS, M_k) = Trunc_n(SHA-512(PK.seed || toByte(0,128-n) || ADRS^c || M_k))
+fn T_k(
+    reg ptr u8[SPX_N] out,        // output: buffer the result gets written to
+    reg ptr u8[SPX_N] pkseed,     // PK.seed
+    reg ptr u32[8] adrs,          // ADRS
+    reg ptr u8[SPX_K*SPX_N] roots // concatenation of all roots in a FORS forest
+) -> reg ptr u8[SPX_N] // -> out
+{
+    () = #spill(out); // not needed until the end of the function
+
+    // stack buffer that will contain the concatenated inputs
+    // buf = PK.seed || toByte(0,64-n) || ADRS^c || M_k         (for sha2-128)
+    //     = SPX_N    + (64-SPX_N)      + 22      + SPX_K*SPX_N (for sha2-128)
+    //     =        ... (128-SPX_N) ...                         (for sha2-192 and sha2-256)
+    //     =       SHA512_IN              + 22      + SPX_K*SPX_N (any case)
+    stack u8[SHA512_IN + 22 + SPX_K*SPX_N] buf;
+
+    // buffer for the output
+    stack u8[SHA512_OUT] digest;
+
+    inline int i;
+
+    // buf = PK.seed
+    buf[0 : SPX_N] = __copy_nbytes(buf[0 : SPX_N], pkseed);
+
+    // buf = PK.seed || zero-padding
+    for i=SPX_N to SHA512_IN { buf[i] = 0; } 
+
+    // buf = PK.seed || zero-padding || ADRS^c
+    buf[SHA512_IN : 22] = __adrs_compress(buf[SHA512_IN : 22], adrs);
+
+    // buf = PK.seed || zero-padding || ADRS^c || M_k
+    for i=0 to SPX_K {
+        buf[SHA512_IN+22+i*SPX_N : SPX_N] = __copy_nbytes(buf[SHA512_IN+22+i*SPX_N : SPX_N], roots[i*SPX_N : SPX_N]);
+    }
+
+    // compute digest = sha512(PK.seed || zero-padding || ADRS^c || M_k)
+    digest = sha512_compress_fors::__sha512(digest, buf);
+
+    () = #unspill(out);
+
+    // truncate the message digest to the correct length by copying only the first SPX_N bytes
+    out = __copy_nbytes(out, digest[0 : SPX_N]);
+    return out;
+}
+
+inline // inline wrapper that splits parameter live-ranges, to aid the Jasmin compiler
+fn __T_k(
+    reg ptr u8[SPX_N] out,        // output: buffer the result gets written to
+    reg ptr u8[SPX_N] pkseed,     // PK.seed
+    reg ptr u32[8] adrs,          // ADRS
+    reg ptr u8[SPX_K*SPX_N] roots // concatenation of all roots in a FORS forest
+) -> reg ptr u8[SPX_N] // -> out
+{
+    // split live-range of the input parameters into two segments
+    out = out; pkseed = pkseed; adrs = adrs; roots = roots;
+
+    out = T_k(out, pkseed, adrs, roots);
+
+    // split live-range of the output parameters into two segments
+    out = out;
+
+    return out;
+}

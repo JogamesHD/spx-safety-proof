@@ -1,0 +1,3 @@
+require "../../params/params-spx-shake-256f.jinc" // SPHINCS+ parameters
+require "hash/hash_shake256.jinc" // hash function implementations
+require "spx/spx_shake.jinc" // SPHINCS+ SHA2 or SHAKE variant

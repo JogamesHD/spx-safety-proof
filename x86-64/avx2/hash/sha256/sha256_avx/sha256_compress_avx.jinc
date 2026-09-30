@@ -1,0 +1,447 @@
+// adapted from https://github.com/strub/sha256/tree/main
+
+namespace sha256_avx {
+  param int STATE_u32_SIZE  = 8;
+  param int STATE_u8_SIZE   = 4 * STATE_u32_SIZE;
+  param int STATE_u128_SIZE = STATE_u32_SIZE / 4;
+
+  param int ROUNDS_NUM            = 64;
+  param int FINAL_ROUND_START_IDX = 48;
+
+  param int sigma0_0 =  7;
+  param int sigma0_1 = 18;
+  param int sigma0_2 =  3;
+  param int sigma1_0 = 17;
+  param int sigma1_1 = 19;
+  param int sigma1_2 = 10;
+
+  param int Sigma0_0 =  2;
+  param int Sigma0_1 = 13;
+  param int Sigma0_2 = 22;
+  param int Sigma1_0 =  6;
+  param int Sigma1_1 = 11;
+  param int Sigma1_2 = 25;
+
+  param int BLOCK_SIZE         = 64;
+  param int BLOCK_VEC_SIZE     = BLOCK_SIZE / 16;
+  param int BLOCK_VEC_u32_SIZE = BLOCK_SIZE / 4;
+
+  param int SCHEDULE_u32_SIZE = 16;
+  param int SCHEDULE_u8_SIZE  = 4 * SCHEDULE_u32_SIZE;
+
+  type word = u32;
+
+  u128[ROUNDS_NUM / 4] k256 = {
+    (4u32)[0xe9b5dba5, 0xb5c0fbcf, 0x71374491, 0x428a2f98],
+    (4u32)[0xab1c5ed5, 0x923f82a4, 0x59f111f1, 0x3956c25b],
+    (4u32)[0x550c7dc3, 0x243185be, 0x12835b01, 0xd807aa98],
+    (4u32)[0xc19bf174, 0x9bdc06a7, 0x80deb1fe, 0x72be5d74],
+    (4u32)[0x240ca1cc, 0x0fc19dc6, 0xefbe4786, 0xe49b69c1],
+    (4u32)[0x76f988da, 0x5cb0a9dc, 0x4a7484aa, 0x2de92c6f],
+    (4u32)[0xbf597fc7, 0xb00327c8, 0xa831c66d, 0x983e5152],
+    (4u32)[0x14292967, 0x06ca6351, 0xd5a79147, 0xc6e00bf3],
+    (4u32)[0x53380d13, 0x4d2c6dfc, 0x2e1b2138, 0x27b70a85],
+    (4u32)[0x92722c85, 0x81c2c92e, 0x766a0abb, 0x650a7354],
+    (4u32)[0xc76c51a3, 0xc24b8b70, 0xa81a664b, 0xa2bfe8a1],
+    (4u32)[0x106aa070, 0xf40e3585, 0xd6990624, 0xd192e819],
+    (4u32)[0x34b0bcb5, 0x2748774c, 0x1e376c08, 0x19a4c116],
+    (4u32)[0x682e6ff3, 0x5b9cca4f, 0x4ed8aa4a, 0x391c0cb3],
+    (4u32)[0x8cc70208, 0x84c87814, 0x78a5636f, 0x748f82ee],
+    (4u32)[0xc67178f2, 0xbef9a3f7, 0xa4506ceb, 0x90befffa]
+  };
+
+  u128 gshufmask =
+    (4u32)[0x0c0d0e0f, 0x08090a0b, 0x04050607, 0x00010203];
+
+  u128 glomask = (4u32)[-1, -1, 0x0b0a0908, 0x03020100];
+  u128 ghimask = (4u32)[0x0b0a0908, 0x03020100, -1, -1];
+
+  //_JogamesHD_ Every byte from in is read, so it must be fully initialized
+  #[safety =
+     {
+      requires = is_arr_init(in, 0, 16*4),
+      ensures = is_arr_init(in, 0, 16*4)
+     }
+   ]
+  inline
+  fn rotate(reg u128[4] in) -> reg u128[4] {
+    reg u128 tmp;
+
+    tmp   = in[0];
+    in[0] = in[1];
+    in[1] = in[2];
+    in[2] = in[3];
+    in[3] = tmp;
+    return in;
+  }
+
+  //_JogamesHD_ Every byte from in is read, so it must be fully initialized
+  //_JogamesHD_ _Question_ Do I need to make a statement about tmp? Probably.
+  #[safety =
+     {
+      requires = is_arr_init(x, 0, 16*4),
+      ensures = is_arr_init(x, 0, 16*4)
+     }
+   ]
+  inline
+  fn update(reg u128[4] x, reg u128 k, reg u128 lomask, reg u128 himask) -> reg u128[4], reg u128 {
+    reg u128[4] t;
+    reg u128 tmp;
+
+    t[0] = #VPALIGNR_128(x[1], x[0], 4);
+    t[3] = #VPALIGNR_128(x[3], x[2], 4);
+
+    t[2] = #VPSRL_4u32(t[0], sigma0_0);
+    x[0] = #VPADD_4u32(x[0], t[3]);
+    t[3] = #VPSRL_4u32(t[0], sigma0_2);
+    t[1] = #VPSLL_4u32(t[0], 32 - sigma0_1);
+
+    t[0] = t[3] ^ t[2];
+    t[3] = #VPSHUFD_128(x[3], 0xfa);
+    t[2] = #VPSRL_4u32(t[2], sigma0_1 - sigma0_0);
+    t[0] = t[0] ^ t[1];
+    t[0] = t[0] ^ t[2];
+
+    t[1] = #VPSLL_4u32(t[1], sigma0_1 - sigma0_0);
+    t[2] = #VPSRL_4u32(t[3], sigma1_2);
+
+    t[3] = #VPSRL_2u64(t[3], sigma1_0);
+    tmp  = t[0] ^ t[1];
+    x[0] = #VPADD_4u32(x[0], tmp);  
+
+    t[2] = t[2] ^ t[3];
+    t[3] = #VPSRL_2u64(t[3], sigma1_1 - sigma1_0);
+    t[2] = t[2] ^ t[3];
+    t[2] = #VPSHUFB_128(t[2], lomask);
+    x[0] = #VPADD_4u32(x[0], t[2]);
+
+    t[3] = #VPSHUFD_128(x[0], 0x50);
+    t[2] = #VPSRL_4u32(t[3], sigma1_2);
+    t[3] = #VPSRL_2u64(t[3], sigma1_0);
+    t[2] = t[2] ^ t[3];
+
+    t[3] = #VPSRL_2u64(t[3], sigma1_1 - sigma1_0);
+    tmp  = t[2] ^ t[3];
+    tmp  = #VPSHUFB_128(tmp, himask);
+    x[0] = #VPADD_4u32(x[0], tmp);
+
+    x = rotate(x);
+
+    tmp = #VPADD_4u32(x[3], k);
+
+    return x, tmp;
+  }
+
+  //_JogamesHD_ 16*BLOCK_VEC_SIZE bytes from data are read, so they must be initialized
+  #[safety =
+     {
+      requires = is_arr_init(data, 0, 16*BLOCK_VEC_SIZE),
+      res = { x, not_needed}, //_JogamesHD_ _Question_ Is this allowed?
+      ensures = is_arr_init(x, 0, 16*BLOCK_VEC_SIZE) && is_arr_init(sch, 0, 16*BLOCK_VEC_SIZE) &&
+      is_arr_init(data, 0, 16*BLOCK_VEC_SIZE)
+     }
+   ]
+  inline
+  fn load_data(
+    reg ptr u8[BLOCK_SIZE] data,
+    reg ptr u32[SCHEDULE_u32_SIZE] sch
+  ) -> reg u128[BLOCK_VEC_SIZE], reg ptr u32[SCHEDULE_u32_SIZE] {
+    reg u128[BLOCK_VEC_SIZE] x;
+    reg u128 k;
+
+    inline int i;
+
+    for i = 0 to BLOCK_VEC_SIZE {
+      x[i] = data[:u128 i];
+      x[i] = #VPSHUFB_128(x[i], gshufmask);
+      k = k256[i];
+      k = #VPADD_4u32(x[i], k);
+      sch[:u128 i] = k;
+    }
+
+    return x, sch;
+  }
+
+  //_JogamesHD_
+  inline
+  fn Ch(reg u32 x, reg u32 y, reg u32 z) -> reg u32 {
+    reg u32 r, t;
+
+    r  = x;
+    r &= y;
+    t  = !x;
+    t &= z;
+    r ^= t;
+
+    return r;
+  }
+
+  //_JogamesHD_
+  inline
+  fn Maj(reg u32 x, reg u32 y, reg u32 z) -> reg u32 {
+    reg u32 r, t;
+
+    r  = x;
+    r &= y;
+
+    t  = x;
+    t &= z;
+    r ^= t;
+
+    t  = y;
+    t &= z;
+    r ^= t;
+
+    return r;
+  }
+
+  //_JogamesHD_
+  inline
+  fn Sigma0(reg u32 x) -> reg u32 {
+    reg u32 t, r;
+
+    r     = x;
+    r  >>r= Sigma0_0;
+
+    t    = x;
+    t >>r= Sigma0_1;
+    r   ^= t;
+
+    t    = x;
+    t >>r= Sigma0_2;
+    r   ^= t;
+
+    return r;
+  }
+
+  //_JogamesHD_
+  inline
+  fn Sigma1(reg u32 x) -> reg u32 {
+    reg u32 t, r;
+
+    r     = x;
+    r  >>r= Sigma1_0;
+
+    t    = x;
+    t >>r= Sigma1_1;
+    r   ^= t;
+
+    t    = x;
+    t >>r= Sigma1_2;
+    r   ^= t;
+
+    return r;
+  }
+
+  //_JogamesHD_ Every byte from state is read, so it must be fully initialized
+  #[safety =
+     {
+      requires = is_arr_init(state, 0, 4*8),
+      ensures = is_arr_init(state, 0, 4*8)
+     }
+   ]
+  inline
+  fn rotate_state(
+    reg ptr u32[STATE_u32_SIZE] state
+  ) -> reg ptr u32[STATE_u32_SIZE] {
+    reg u32 tmp, w7;
+    inline int i;
+
+    w7 = state[7];
+    for i = 7 downto 0 {
+      tmp = state[i-1];
+      state[i] = tmp;
+    }
+    state[0] = w7;
+
+    return state;
+  }
+
+  //_JogamesHD_ Every byte from state is read, so it must be fully initialized
+  #[safety =
+     {
+      requires = is_arr_init(state, 0, 4*8),
+      ensures = is_arr_init(state, 0, 4*8)
+     }
+   ]
+  inline
+  fn sha_round(
+    reg ptr u32[STATE_u32_SIZE] state,
+    reg u32 x,
+    inline int k
+  ) -> reg ptr u32[STATE_u32_SIZE] {
+    reg u32 t, tmp, w0, w1, w2;
+
+    t  = state[4];
+    t  = Sigma1(t);
+    t += state[7];
+    t += x;
+
+    w0   = state[4];
+    w1   = state[5];
+    w2   = state[6];
+    tmp  = Ch(w0, w1, w2);
+    t   += tmp;
+    t   += k;
+
+    state[3] += t;
+
+    w0   = state[0];
+    w1   = state[1];
+    w2   = state[2];
+    tmp  = Maj(w0, w1, w2);
+    t   += tmp;
+    w0   = Sigma0(w0);
+    t   += w0;
+
+    state[7] = t;
+
+    state = rotate_state(state);
+
+    return state;
+  }
+
+  //_JogamesHD_ 16*STATE_u128_SIZE bytes are read from in, so they must be initialized
+  #[safety =
+     {
+      requires = is_arr_init(in, 0, 16*STATE_u128_SIZE) && is_arr_init(out, 0, 16*STATE_u128_SIZE),
+      ensures = is_arr_init(out, 0, 16*STATE_u128_SIZE)
+     }
+   ]
+  inline
+  fn accumulate_state(
+    reg ptr u32[STATE_u32_SIZE] out,
+    reg ptr u32[STATE_u32_SIZE] in
+  ) -> reg ptr u32[STATE_u32_SIZE] {
+    inline int i;
+    reg u128 tmp;
+
+    for i = 0 to STATE_u128_SIZE {
+      tmp = in[:u128 i];
+      tmp = #VPADD_4u32(tmp, out[:u128 i]);
+      out[:u128 i] = tmp;
+    }
+
+    return out;
+  }
+
+  //_JogamesHD_ Precondition mainly derived from preconditions for update and sha_round
+  #[safety =
+     {
+      requires = is_arr_init(state, 0, 4*8) && is_arr_init(x, 0, 16*4) &&
+      is_arr_init(sch, 0, 16*BLOCK_VEC_SIZE),
+      ensures = is_arr_init(state, 0, 4*8) && is_arr_init(sch, 0, 16*BLOCK_VEC_SIZE)
+     }
+   ]
+  inline
+  fn round_0_47(
+    reg ptr u32[STATE_u32_SIZE] state,
+    reg u128[BLOCK_VEC_SIZE] x,
+    reg ptr u32[SCHEDULE_u32_SIZE] sch
+  ) ->
+    reg ptr u32[STATE_u32_SIZE],
+    reg ptr u32[SCHEDULE_u32_SIZE]
+  {
+    reg u128 lomask = glomask;
+    reg u128 himask = ghimask;
+    reg u128 k, y;
+    reg ptr u128[ROUNDS_NUM / 4] k256p;
+
+    reg u64 j;
+    inline int i;
+
+    k256p = k256;
+
+    for i = 0 to 3 {
+      j = 0;
+      while (j < 16 * BLOCK_VEC_SIZE) {
+        k     = k256p.[:u128 j + 16 * BLOCK_VEC_SIZE * (i + 1)];
+        x, y  = update(x, k, lomask, himask);
+
+        state = sha_round(state, sch.[:u32 (j     )], 0);
+        state = sha_round(state, sch.[:u32 (j +  4)], 0);
+        state = sha_round(state, sch.[:u32 (j +  8)], 0);
+        state = sha_round(state, sch.[:u32 (j + 12)], 0);
+
+        sch.[:u128 j] = y;
+
+        j += 16;
+      }
+    }
+
+    return state, sch;
+  }
+
+  //_JogamesHD_ What is read depends on the value of ROUNDS_NUM - FINAL_ROUND_START_IDX and where the reads start,
+  //_JogamesHD_ i.e. FINAL_ROUND_START_IDX.
+  #[safety =
+     {
+      requires = is_arr_init(state, 0, 4*8) &&
+      is_arr_init(sch, 4*(FINAL_ROUND_START_IDX % 16), 4*(min(16 - (FINAL_ROUND_START_IDX % 16), ROUNDS_NUM - FINAL_ROUND_START_IDX))) &&
+      is_arr_init(sch, 0, 4*(max(0, (ROUNDS_NUM - FINAL_ROUND_START_IDX) - (16 - (FINAL_ROUND_START_IDX % 16))))),
+      ensures = is_arr_init(state, 0, 4*8)
+     }
+   ]
+  inline
+  fn round_48_63(
+    reg ptr u32[STATE_u32_SIZE] state,
+    reg ptr u32[SCHEDULE_u32_SIZE] sch
+  ) -> reg ptr u32[STATE_u32_SIZE] {
+    inline int i;
+    reg u32 x;
+
+    for i = FINAL_ROUND_START_IDX to ROUNDS_NUM {
+      x = sch[:u32 (i & 0xf)];
+      state = sha_round(state, x, 0);
+    }
+    return state;
+  }
+
+  //_JogamesHD_ Every byte from in is read, so it must be fully initialized
+  #[safety =
+     {
+      requires = is_arr_init(in, 0, 16*STATE_u128_SIZE),
+      ensures = is_arr_init(out, 0, 16*STATE_u128_SIZE) && is_arr_init(in, 0, 16*STATE_u128_SIZE)
+     }
+   ]
+  inline
+  fn copy_state(
+    reg ptr u32[STATE_u32_SIZE] out,
+    reg ptr u32[STATE_u32_SIZE] in
+  ) -> reg ptr u32[STATE_u32_SIZE] {
+    inline int i;
+    reg u128 tmp;
+
+    for i = 0 to STATE_u128_SIZE {
+      tmp = in[:u128 i];
+      out[:u128 i] = tmp;
+    }
+    return out;
+  }
+
+  //_JogamesHD_ Precondition is derived from preconditions of copy_state and load_data
+  #[safety =
+     {
+      requires = is_arr_init(state, 0, 16*STATE_u128_SIZE) && is_arr_init(data, 0, 16*BLOCK_VEC_SIZE),
+      ensures = is_arr_init(state, 0, 16*STATE_u128_SIZE) && is_arr_init(data, 0, 16*BLOCK_VEC_SIZE)
+     }
+   ]
+  fn sha256_compress_avx(
+    reg ptr u32[STATE_u32_SIZE] state,
+    reg ptr u8[BLOCK_SIZE] data
+  )
+  ->
+    reg ptr u32[STATE_u32_SIZE]
+  {
+    stack u32[STATE_u32_SIZE] cstate;
+    stack u32[SCHEDULE_u32_SIZE] sch;
+    reg u128[BLOCK_VEC_SIZE] x;
+
+    cstate = copy_state(cstate, state);
+    x, sch = load_data(data, sch);
+    cstate, sch = round_0_47(cstate, x, sch);
+    cstate = round_48_63(cstate, sch);
+    state = accumulate_state(state, cstate);
+    return state;
+  }
+}

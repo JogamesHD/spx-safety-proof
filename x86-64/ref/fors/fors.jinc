@@ -1,0 +1,557 @@
+// namespace for the base_t computation of the FORS indices
+namespace baseb_fors {
+  param int B      = SPX_T;
+  param int LG_B   = SPX_A;
+  param int OUTLEN = SPX_K;
+  param int INLEN  = SPX_MD_LEN;
+  require "../misc/baseb.jinc" // algorithm 4 of SLH-DSS: base_2^b
+}
+
+/////////////////////// HELPER FUNCTIONS ///////////////////////
+
+// compute the position (label) of a tree node in a FORS tree's flattened array,
+// where the flattened array is a one-dimensional array with the nodes of each layer,
+// starting with the leaves, all concatenated
+inline
+fn __forest_label(
+    reg u32 i, // node's horizontal index
+    reg u32 z  // node's height
+) -> reg u64 { // -> label
+    reg u64 label; // node's array label
+    reg u32 exp;   // temporary variable for exponent computations
+    reg u64 pow;   // temporary variable for power computations
+    reg u64 imod;  // temporary variable for modulo computations
+
+    // 2^(a+1)-1 is the total number of nodes in the tree
+    // 2^(a+1-z)-1 is the total number of nodes from layer z upwards
+    // 2^(a+1)-1 - (2^(a+1-z)-1) = 2^(a+1) - 2^(a+1-z),
+    // is the label of the leftmost node in the target layer
+    // i is the index in the target layer, but we need to account for the
+    // fact that a horizontal index in FORS runs over all trees in the forest,
+    // so the label we are looking for is 2^(a+1) - 2^(a+1-z) + (i mod 2^(a-z))
+
+    // compute label = 2^(a+1)
+    exp = SPX_A+1; // exp = a + 1
+    pow = 1;       // pow = 2^0
+    _, _, _, _, _, pow = #SHL(pow, exp); // pow = 2^(a+1)
+    label = pow;   // label = 2^(a+1)
+
+    // compute label = 2^(a+1) - 2^(a+1-z)
+    exp -= z;     // exp = a + 1 - z
+    pow = 1;      // pow = 2^0
+    _, _, _, _, _, pow = #SHL(pow, exp); // pow = 2^(a+1-z)
+    label -= pow; // label = 2^(a+1) - 2^(a+1-z)
+
+    // compute label = 2^(a+1) - 2^(a+1-z) + (i mod 2^(a-z))
+    pow >>= 1;      // pow = 2^(a-z)
+    imod = (64u) i; // imod = i
+    imod %= pow;    // imod = i mod 2^(a-z)
+    label += imod;  // label = 2^(a+1) - 2^(a+1-z) + (i mod 2^(a-z))
+
+    return label;
+}
+
+//////////////////////// MAIN FUNCTIONS ////////////////////////
+
+/*-------------------------------------------------------------+
+| ALGORITHM 14 FROM SLH-DSS (FIPS 205)                         |
+| Generates a FORS private-key value.                          |
++-------------------------------------------------------------*/
+fn fors_skgen(
+    reg ptr u8[SPX_N] sk,     // output: FORS secret key value
+    reg ptr u8[SPX_N] skseed, // SK.seed
+    reg ptr u8[SPX_N] pkseed, // PK.seed
+    reg ptr u32[8] adrs,      // ADRS
+    reg u32 idx               // secret key index
+) -> reg ptr u8[SPX_N] // -> sk
+{
+    // stack variables
+    stack u32[8] skadrs;
+
+    // register variables
+    reg u32 kpa; // ADRS key pair address
+
+    // clone ADRS and set the correct type for computing FORS secret keys
+    skadrs = __adrs_clone(skadrs, adrs);
+    skadrs = __adrs_set_type_and_clear(skadrs, SPX_ADRS_TYPE_FORS_PRF);
+
+    // get the key pair address from ADRS, and set it in skadrs
+    kpa = __adrs_get_key_pair_addr(adrs);
+    skadrs = __adrs_set_key_pair_addr(skadrs, kpa);
+
+    // set the tree index
+    skadrs = __adrs_set_tree_index(skadrs, idx);
+
+    // compute the secret key value
+    sk = __PRF(sk, pkseed, skseed, skadrs);
+
+    return sk;
+}
+
+inline // inline wrapper that splits parameter live-ranges, to aid the Jasmin compiler
+fn __fors_skgen(
+    reg ptr u8[SPX_N] sk,     // output: FORS secret key value
+    reg ptr u8[SPX_N] skseed, // SK.seed
+    reg ptr u8[SPX_N] pkseed, // PK.seed
+    reg ptr u32[8] adrs,      // ADRS
+    reg u32 idx               // secret key index
+) -> reg ptr u8[SPX_N] // -> sk
+{
+    // split live-range of the parameters into two segments
+    sk = sk; skseed = skseed; pkseed = pkseed; adrs = adrs; idx = idx;
+
+    sk = fors_skgen(sk, skseed, pkseed, adrs, idx);
+
+    // split live-range of the output parameters into two segments
+    sk = sk;
+
+    return sk;
+}
+
+/*-------------------------------------------------------------+
+| ALGORITHM 15 FROM SLH-DSS (FIPS 205)                         |
+| Computes the root of a Merkle subtree of FORS public values. |
+| (iterative instead of recursive)                             |
++-------------------------------------------------------------*/
+fn fors_node(
+    reg ptr u8[SPX_N] root,   // output: root of the subtree rooted at i,z
+    reg ptr u8[SPX_N] skseed, // SK.seed
+    reg u32 i,                // target node index (horizontal)
+    reg u32 z,                // target node height
+    reg ptr u8[SPX_N] pkseed, // PK.seed
+    reg ptr u32[8] adrs       // ADRS
+) -> reg ptr u8[SPX_N], reg ptr u32[8] // -> root, adrs
+{
+    () = #spill(root);
+
+    // stack variables
+    stack u8[SPX_N] buf_l; // buffer holding the node value of the left child
+    stack u8[SPX_N] buf_r; // buffer holding the node value of the right child
+
+    // stack buffer with enough place to fit one entire (flattened) FORS tree
+    // note that for efficiency only those nodes are computed that are needed
+    // to find the target node, so not necessarily the entire buffer is filled
+    stack u8[FORS_TREE_SIZE * SPX_N] flat_tree;
+
+    // register variables
+    reg u32 layer;     // iterator over the layers
+    reg u32 node;      // node      = horizontal index   of the leftmost  node in the current layer
+    reg u32 rightmost; // rightmost = horizontal index+1 of the rightmost node in the current layer
+    reg u64 label;     // label of the current node
+    reg u64 lnode;     // label of the left child
+    reg u64 rnode;     // label of the right child
+    reg u32 lnode_i;   // horizontal index of the left child
+    reg u32 lnode_z;   // height of the left child
+    reg u64 node_addr; // byte address of 'node' in the buffer
+    reg u64 pow;       // temporary variable for computing powers
+    reg u32 exp;       // temporary variable for computing exponents
+
+    layer = 0; // iterate over the layers
+    while (layer <= z) {
+        () = #spill(z); // free up space in the registers
+
+        // node      = horizontal index   of the leftmost  node in the current layer
+        // rightmost = horizontal index+1 of the rightmost node in the current layer
+        exp = z;                             // exp       = z
+        exp -= layer;                        // exp       = z-layer
+        pow = 1;                             // pow       = 2^0
+        _, _, _, _, _, pow = #SHL(pow, exp); // pow       = 2^(z-layer)
+        node       = (32u) pow;              // node      = 2^(z-layer)
+        rightmost  = (32u) pow;              // rightmost = 2^(z-layer)
+        node      *= i;                      // node      =  i    * 2^(z-layer)
+        rightmost += node;                   // rightmost = (i+1) * 2^(z-layer)
+
+        // iterate over the nodes within the current layer
+        while (node < rightmost) {
+            () = #spill(skseed, rightmost); // free up space in the registers
+
+            if (layer == 0) {
+                // layer-0 leaf node: the node value is a WOTS+ public key
+
+                // set the correct values in ADRS for WOTS hashing
+                adrs = __adrs_set_tree_height(adrs, layer);
+                adrs = __adrs_set_tree_index(adrs, node);
+
+                // compute the label of the current node
+                label = __forest_label(node, layer); // label = forest_label(node, layer)
+
+                // compute the byte address of the current node
+                node_addr = label;  // node_addr = forest_label(node, layer)
+                node_addr *= SPX_N; // node_addr = forest_label(node, layer) * SPX_N
+
+                // compute the FORS secret key value
+                () = #spill(pkseed, adrs, i, layer, node, node_addr);
+                flat_tree[node_addr : SPX_N] = __fors_skgen(flat_tree[node_addr : SPX_N], skseed, pkseed, adrs, node);
+                () = #unspill(pkseed, adrs, i, layer, node, node_addr);
+
+                // compute the hash of the FORS secret key value
+                () = #spill(pkseed, adrs, i, layer, node, node_addr);
+                flat_tree[node_addr : SPX_N] = __F(flat_tree[node_addr : SPX_N], pkseed, adrs);
+                () = #unspill(pkseed, adrs, i, layer, node, node_addr);
+            } else { // layer > 0
+                // internal node: the node value is the hash of its two children lnode and rnode
+
+                // compute the horizontal index and height of the left child
+                lnode_i = node;  // lnode_i = node
+                lnode_i *= 2;    // lnode_i = 2*node
+                lnode_z = layer; // lnode_z = layer
+                lnode_z -= 1;    // lnode_z = layer-1
+
+                // compute the label of the left child
+                label = __forest_label(lnode_i, lnode_z); // label = forest_label(2*node, layer-1)
+
+                // compute the byte address of the left child
+                lnode = label;  // lnode = forest_label(2*node, layer-1)
+                lnode *= SPX_N; // lnode = forest_label(2*node, layer-1) * SPX_N
+
+                // compute the byte address of the right child, which by definition is adjoining the left child
+                rnode = lnode;  // rnode = forest_label(2*node,   layer-1) * SPX_N
+                rnode += SPX_N; // rnode = forest_label(2*node+1, layer-1) * SPX_N
+
+                // copy the children to buffers
+                // note: trying to pass the children to H as two reg ptr (to avoid the needless copying),
+                // gives the error that some reg ptr are not disjoint?
+                buf_l = __copy_nbytes(buf_l, flat_tree[lnode : SPX_N]);
+                buf_r = __copy_nbytes(buf_r, flat_tree[rnode : SPX_N]);
+
+                // set the correct values in ADRS for tree node hashing
+                // (ADRS type is already SPX_ADRS_TYPE_TREE, which is set
+                // in spx.jinc, in slh_sign_internal and slh_verify_internal)
+                adrs = __adrs_set_tree_height(adrs, layer);
+                adrs = __adrs_set_tree_index(adrs, node);
+
+                // compute the label of the parent node
+                label = __forest_label(node, layer); // label = forest_label(node, layer)
+
+                // compute the byte address of the parent node
+                node_addr = label;  // node_addr = forest_label(node, layer)
+                node_addr *= SPX_N; // node_addr = forest_label(node, layer) * SPX_N
+
+                // compute node value = H(PK.seed, ADRS, lnode || rnode)
+                () = #spill(pkseed, adrs, i, layer, node);
+                flat_tree[node_addr : SPX_N] = __H(flat_tree[node_addr : SPX_N], pkseed, adrs, buf_l, buf_r);
+                () = #unspill(pkseed, adrs, i, layer, node);
+            }
+
+            () = #unspill(skseed, rightmost);
+
+            // advance to the next node in the layer
+            node += 1;
+        }
+
+        () = #unspill(z);
+
+        // advance to the next layer
+        layer += 1;
+    }
+
+    () = #unspill(root);
+
+    // write the target node value to the output,
+    // and the target node was the last node written to flat_tree,
+    // so node_addr is still the correct byte address
+    root = __copy_nbytes(root, flat_tree[node_addr : SPX_N]);
+    return root, adrs;
+}
+
+inline // inline wrapper that splits parameter live-ranges, to aid the Jasmin compiler
+fn __fors_node(
+    reg ptr u8[SPX_N] root,   // output: root of the subtree rooted at i,z
+    reg ptr u8[SPX_N] skseed, // SK.seed
+    reg u32 i,                // target node index (horizontal)
+    reg u32 z,                // target node height
+    reg ptr u8[SPX_N] pkseed, // PK.seed
+    reg ptr u32[8] adrs       // ADRS
+) -> reg ptr u8[SPX_N], reg ptr u32[8] // -> root, adrs
+{
+    // split live-range of the parameters into two segments
+    root = root; skseed = skseed; i = i; z = z; pkseed = pkseed; adrs = adrs;
+
+    root, adrs = fors_node(root, skseed, i, z, pkseed, adrs);
+
+    // split live-range of the output parameters into two segments
+    root = root; adrs = adrs;
+
+    return root, adrs;
+}
+
+/*-------------------------------------------------------------+
+| ALGORITHM 16 FROM SLH-DSS (FIPS 205)                         |
+| Generates a FORS signature.                                  |
++-------------------------------------------------------------*/
+fn fors_sign(
+    reg ptr u8[FORS_SIG] sig_fors, // output: FORS signature
+    reg ptr u8[SPX_MD_LEN] md,     // message digest
+    reg ptr u8[SPX_N] skseed,      // SK.seed
+    reg ptr u8[SPX_N] pkseed,      // PK.seed
+    reg ptr u32[8] adrs            // ADRS
+) -> reg ptr u8[FORS_SIG], reg ptr u32[8] // -> sig_fors, adrs
+{
+    // stack variables
+    stack u32[SPX_K] indices; // indices indicating leaf node per tree
+
+    // reg variables
+    reg ptr u8[SPX_N] node; // pointer to one n-byte secret key value or AUTH node in the FORS signature
+    reg u64 i;        // iterator over the forest's trees
+    reg u32 j;        // iterator over the authentication path nodes
+    reg u32 idx_leaf; // horizontal index of a leaf
+    reg u32 idx_sib;  // horizontal index of an authentication node's sibling
+    reg u64 pow;      // temporary variable for power computations
+    reg u32 exp;      // temporary variable for exponent computations
+    reg u32 s;        // the sibling node's horizontal index
+    reg u64 offset;   // byte offset of the tree nodes in the FORS signature
+
+    // compute the base-t leaf indices
+    indices = baseb_fors::__base_b(indices, md);
+
+    offset = 0; // first node will get placed at the start of the FORS signature
+    i = 0; // iterator over the forest's trees
+    while (i < SPX_K) {
+        // the leftmost leaf in the i-th FORS tree is i*2^a,
+        // and the offset within the tree is indices[i], so the index
+        // of the i-th tree's secret key value leaf is i*(2^a) + indices[i]
+        idx_leaf = i;           // idx_leaf = 2^a
+        idx_leaf <<= SPX_A;     // idx_leaf = i*(2^a)
+        idx_leaf += indices[i]; // idx_leaf = i*(2^a) + indices[i]
+
+        // compute the i-th FORS tree's secret key value
+        node = sig_fors[offset : SPX_N]; // get the pointer to the subarray so the full array can be spilled
+        () = #spill(skseed, pkseed, adrs, sig_fors, i, offset);
+        node = __fors_skgen(node, skseed, pkseed, adrs, idx_leaf);
+        () = #unspill(skseed, pkseed, adrs, sig_fors, i, offset);
+        sig_fors[offset : SPX_N] = node; // redesignate the pointer so the region of the full array is not partial
+
+        offset += SPX_N; // one n-byte secret key value has been written
+
+        // compute the sibling node's horizontal index
+        s = indices[i]; // s = indices[i]
+        s ^= 1;         // s = indices[i] XOR 1
+
+        // compute and store the authentication path AUTH for the i-th tree in the forest
+        j = 0; // iterator over the authentication path nodes
+        while (j < SPX_A) {
+            () = #spill(skseed, pkseed, i, j, offset, s);
+
+            // the leftmost leaf in the i-th FORS tree then is i*2^(a-j)
+            exp = SPX_A; // exp = a
+            exp -= j;    // exp = a-j
+            pow = i;     // pow = i
+            _, _, _, _, _, pow = #SHL(pow, exp); // pow = i*2^(a-j)
+            idx_sib = (32u) pow; // idx_sib = i*2^(a-j)
+            idx_sib += s;        // idx_sib = i*2^(a-j) + (floor(indices[i] / 2^j) XOR 1)
+
+            // compute the sibling node
+            node = sig_fors[offset : SPX_N]; // get the pointer to the subarray so the full array can be spilled
+            () = #spill(sig_fors);
+            node, adrs = __fors_node(node, skseed, idx_sib, j, pkseed, adrs);
+            () = #unspill(sig_fors);
+            sig_fors[offset : SPX_N] = node; // redesignate the pointer so the region of the full array is not partial
+
+            () = #unspill(skseed, pkseed, i, j, offset, s);
+
+            // update the sibling node's horizontal index for the next iteration
+            s >>= 1; // s = floor(indices[i] / 2^j)
+            s ^= 1;  // s = floor(indices[i] / 2^j) XOR 1
+
+            offset += SPX_N; // one n-byte node has been written
+            j += 1; // advance to the next AUTH node
+        }
+
+        // advance to the next tree
+        i += 1;
+    }
+
+    return sig_fors, adrs;
+}
+
+inline // inline wrapper that splits parameter live-ranges, to aid the Jasmin compiler
+fn __fors_sign(
+    reg ptr u8[FORS_SIG] sig_fors, // output: FORS signature
+    reg ptr u8[SPX_MD_LEN] md,     // message digest
+    reg ptr u8[SPX_N] skseed,      // SK.seed
+    reg ptr u8[SPX_N] pkseed,      // PK.seed
+    reg ptr u32[8] adrs            // ADRS
+) -> reg ptr u8[FORS_SIG], reg ptr u32[8] // -> sig_fors, adrs
+{
+    // split live-range of the parameters into two segments
+    sig_fors = sig_fors; md = md; skseed = skseed; pkseed = pkseed; adrs = adrs;
+
+    sig_fors, adrs = fors_sign(sig_fors, md, skseed, pkseed, adrs);
+
+    // split live-range of the output parameters into two segments
+    sig_fors = sig_fors; adrs = adrs;
+
+    return sig_fors, adrs;
+}
+
+/*-------------------------------------------------------------+
+| ALGORITHM 17 FROM SLH-DSS (FIPS 205)                         |
+| Computes a FORS public key from a FORS signature.            |
++-------------------------------------------------------------*/
+fn fors_pkfromsig(
+    reg ptr u8[SPX_N] pk_fors,     // output: compressed FORS public key
+    reg ptr u8[FORS_SIG] sig_fors, // FORS signature
+    reg ptr u8[SPX_MD_LEN] md,     // message digest
+    reg ptr u8[SPX_N] pkseed,      // PK.seed
+    reg ptr u32[8] adrs            // ADRS
+) -> reg ptr u8[SPX_N], reg ptr u32[8] // -> pk_fors, adrs
+{
+    () = #spill(pk_fors);
+
+    // stack variables
+    stack u32[SPX_K] indices;
+    stack u32[8] forspkadrs;
+    stack u8[SPX_K*SPX_N] roots;
+    stack u8[SPX_N] node0;
+    stack u8[SPX_N] node1;
+    stack u8[SPX_N] buf0;
+    stack u8[SPX_N] buf1;
+
+    // register variables
+    reg ptr u8[SPX_N] sk; // pointer to one FORS secret key
+    reg u32 j;
+    reg u32 check;
+    reg u32 height;
+    reg u32 kpa;
+    reg u64 i;
+    reg u64 offset;
+    reg u64 offset_roots;
+    reg u32 idx_auth;
+    reg u32 idx_leaf;
+    reg u32 idx_tree;
+
+    // compute the base-t leaf indices
+    indices = baseb_fors::__base_b(indices, md);
+
+    offset       = 0; // first node starts at byte offset 0 in sig_fors
+    offset_roots = 0; // first root will get placed at the start of offset_roots
+    i = 0; // iterator over the forest's trees
+    while (i < SPX_K) {
+        () = #spill(offset_roots);
+
+        // extract the secret key value from the leaf and copy it to node0
+        sk = sig_fors[offset : SPX_N];
+        node0 = __copy_nbytes(node0, sk);
+
+        // set the height of the leaf to 0 in ADRS
+        height = 0;
+        adrs = __adrs_set_tree_height(adrs, height);
+
+        // the leftmost leaf in the i-th FORS tree is i*2^a,
+        // and the offset within the tree is indices[i], so the index
+        // of the i-th tree's secret key value leaf is i*(2^a) + indices[i]
+        idx_leaf = i;           // idx_leaf = 2^a
+        idx_leaf <<= SPX_A;     // idx_leaf = i*(2^a)
+        idx_leaf += indices[i]; // idx_leaf = i*(2^a) + indices[i]
+        adrs = __adrs_set_tree_index(adrs, idx_leaf);
+
+        // compute the hash of the FORS secret key value
+        () = #spill(pkseed, adrs, sig_fors, i, offset);
+        node0 = __F(node0, pkseed, adrs);
+        () = #unspill(pkseed, adrs, sig_fors, i, offset);
+
+        offset += SPX_N; // one n-byte secret key value has been consumed
+
+        // compute the authentication path node's horizontal index
+        idx_auth = indices[i];
+
+        // compute the authentication path nodes for the i-th tree in the forest
+        j = 0; // iterator over the authentication path nodes
+        while (j < SPX_A) {
+            // compute the parent node's height
+            height = j;  // height = j
+            height += 1; // height = j + 1
+            adrs = __adrs_set_tree_height(adrs, height);
+
+            // check whether the authentication path node is
+            // a left child (indices[i]/2^j is even) or a right child (indices[i]/2^j is odd)
+            check = idx_auth; // check = floor(indices[i] / 2^j)
+            check &= 1;       // check = floor(indices[i] / 2^j) mod 2
+
+            () = #spill(j, idx_auth);
+
+            if (check == 0) { // floor(indices[i] / 2^j) is even
+                // compute the parent node's horizontal index
+                idx_tree = __adrs_get_tree_index(adrs);
+                idx_tree >>= 1;
+
+                // set the parent node's horizontal index
+                adrs = __adrs_set_tree_index(adrs, idx_tree);
+
+                // buf = node0 || AUTH[i]
+                buf0 = __copy_nbytes(buf0, node0);
+                buf1 = __copy_nbytes(buf1, sig_fors[offset : SPX_N]);
+            } else { // floor(indices[i] / 2^j) is odd
+                // compute the parent node's horizontal index
+                idx_tree = __adrs_get_tree_index(adrs);
+                idx_tree -= 1;
+                idx_tree >>= 1;
+
+                // set the parent node's horizontal index
+                adrs = __adrs_set_tree_index(adrs, idx_tree);
+
+                // buf = AUTH[i] || node0
+                buf0 = __copy_nbytes(buf0, sig_fors[offset : SPX_N]);
+                buf1 = __copy_nbytes(buf1, node0);
+            }
+
+            // compute the parent node
+            () = #spill(pkseed, adrs, sig_fors, i, offset);
+            node1 = __H(node1, pkseed, adrs, buf0, buf1);
+            () = #unspill(pkseed, adrs, sig_fors, i, offset);
+
+            // save the parent node's value to become the next iteration's child node
+            node0 = __copy_nbytes(node0, node1);
+
+            () = #unspill(j, idx_auth);
+
+            // update the authentication path node's horizontal index for the next iteration
+            idx_auth >>= 1; // idx_auth = floor(indices[i] / 2^j)
+
+            offset += SPX_N; // one n-byte node has been processed
+            j += 1; // advance to the next node
+        }
+
+        () = #unspill(offset_roots);
+
+        // copy the last-computed node (the root) to roots
+        roots[offset_roots : SPX_N] = __copy_nbytes(roots[offset_roots : SPX_N], node0);
+
+        offset_roots += SPX_N; // one n-byte root has been written
+        i += 1; // advance to the next tree
+    }
+
+    // set the correct ADRS values for FORS public key generation
+    forspkadrs = __adrs_clone(forspkadrs, adrs);
+    forspkadrs = __adrs_set_type_and_clear(forspkadrs, SPX_ADRS_TYPE_FORS_ROOTS);
+
+    // get the key pair address from ADRS, and set it in forspkadrs
+    kpa = __adrs_get_key_pair_addr(adrs);
+    forspkadrs = __adrs_set_key_pair_addr(forspkadrs, kpa);
+
+    () = #unspill(pk_fors);
+
+    pk_fors = __T_k(pk_fors, pkseed, forspkadrs, roots);
+
+    return pk_fors, adrs;
+}
+
+inline // inline wrapper that splits parameter live-ranges, to aid the Jasmin compiler
+fn __fors_pkfromsig(
+    reg ptr u8[SPX_N] pk_fors,     // output: compressed FORS public key
+    reg ptr u8[FORS_SIG] sig_fors, // FORS signature
+    reg ptr u8[SPX_MD_LEN] md,     // message digest
+    reg ptr u8[SPX_N] pkseed,      // PK.seed
+    reg ptr u32[8] adrs            // ADRS
+) -> reg ptr u8[SPX_N], reg ptr u32[8] // -> pk_fors, adrs
+{
+    // split live-range of the parameters into two segments
+    pk_fors = pk_fors; sig_fors = sig_fors; md = md; pkseed = pkseed; adrs = adrs;
+
+    pk_fors, adrs = fors_pkfromsig(pk_fors, sig_fors, md, pkseed, adrs);
+
+    // split live-range of the output parameters into two segments
+    pk_fors = pk_fors; adrs = adrs;
+
+    return pk_fors, adrs;
+}

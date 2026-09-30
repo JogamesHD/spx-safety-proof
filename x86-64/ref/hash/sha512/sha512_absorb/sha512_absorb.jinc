@@ -1,0 +1,326 @@
+fn compress(
+  reg ptr u64[8] _H,
+  reg ptr u64[80] W
+) -> reg ptr u64[8], reg ptr u64[80] // -> _H, W // W is only returned because W needs to be writable
+{
+  inline int t;
+  reg u64 T1 T2 a b c d e f g h r;
+  reg ptr u64[80] Kp;
+  stack ptr u64[8] Hp;
+  reg ptr u64[8] H;
+  reg u64 tr;
+  reg u64 swap;
+
+  Kp = SHA512_K;
+  Hp = _H;
+
+  H = Hp;
+
+  // W is written to one byte at a time, but is read from in 64-bit words,
+  // so we need to account for the Endianness
+  
+  for t=0 to 16 {
+    swap = W[t];
+    swap = #BSWAP_64(swap);
+    W[t] = swap;
+  }
+
+  for t=16 to 80 { W = __SHA512_Wt_ptr_ref(W, t); }
+
+  a, b, c, d, e, f, g, h, H = __SHA512_load_H_ref(H);
+  Hp = H;
+
+  tr = 0;
+  while(tr < 80) {
+    //T1 = h + BSIG1(e) + CH(e,f,g) + Kt + Wt
+    T1  = h;
+    r   = __SHA512_BSIG1_ref(e);
+    T1 += r;
+    r   = __SHA512_CH_ref(e,f,g);
+    T1 += r;
+    T1 += Kp[tr];
+    T1 += W[tr];
+
+    //T2 = BSIG0(a) + MAJ(a,b,c)
+    T2  = __SHA512_BSIG0_ref(a);
+    r   = __SHA512_MAJ_ref(a,b,c);
+    T2 += r;
+
+    h  = g; g  = f; f  = e; e  = d;  e += T1;
+    d  = c; c  = b; b  = a; a  = T1; a += T2;
+
+    tr+= 1;
+  }
+
+  H = Hp;
+  a += H[0]; b += H[1]; c += H[2]; d += H[3];
+  e += H[4]; f += H[5]; g += H[6]; h += H[7];
+
+  H = __SHA512_store_H_ref(H,a,b,c,d,e,f,g,h);
+
+  _H = H;
+  return _H, W;
+}
+
+fn absorb_pointer(
+  reg ptr u64[8] Hp,
+  reg ptr u64[80] W,
+  reg u64 idx_W,
+  reg u64 in_ptr,
+  reg u64 in_len
+) -> reg ptr u64[8], reg ptr u64[80], reg u64 // -> Hp, W, idx_W
+{
+  reg u64 avail;
+  reg u64 target;
+
+  avail = 128;
+  avail -= idx_W;
+
+  // if enough message bytes are present, fill the current block and run the compression function once
+  if (in_len >= avail) {
+    // fill the rest of the block
+    while (idx_W < 128) {
+      W[:u8 idx_W] = [:u8 in_ptr];
+      idx_W  += 1;
+      in_ptr += 1;
+    }
+
+    // run the compression function
+    () = #spill(in_ptr, in_len, avail);
+    Hp, W = compress(Hp, W);
+    () = #unspill(in_ptr, in_len, avail);
+
+    idx_W = 0;
+    in_len -= avail; // 'avail' number of bytes consumed
+  }
+
+  // if enough message bytes are present, process full blocks of message bytes
+  while (in_len >= 128) {
+    // fill the rest of the block
+    while (idx_W < 128) {
+      W[:u8 idx_W] = [:u8 in_ptr];
+      idx_W += 1;
+      in_ptr += 1;
+    }
+
+    // run the compression function
+    () = #spill(in_ptr, in_len);
+    Hp, W = compress(Hp, W);
+    () = #unspill(in_ptr, in_len);
+
+    idx_W = 0;
+    in_len -= 128; // 128 bytes consumed
+  }
+
+  // write the remainder of the message bytes to W and update idx_W
+  target = idx_W;
+  target += in_len;
+  while (idx_W < target) {
+    W[:u8 idx_W] = [:u8 in_ptr];
+    idx_W  += 1;
+    in_ptr += 1;
+  }
+
+  return Hp, W, idx_W;
+}
+
+fn absorb_fixed(
+  reg ptr u64[8] Hp,
+  reg ptr u64[80] W,
+  reg u64 idx_W,
+  reg ptr u8[PREFIXLEN] prefix
+) -> reg ptr u64[8], reg ptr u64[80], reg u64 // -> Hp, W, idx_W
+{
+  reg u64 avail;
+  reg u64 in_ptr;
+  reg u64 in_len;
+  reg u64 target;
+
+  in_ptr = 0;
+  in_len = PREFIXLEN;
+  avail = 128;
+  avail -= idx_W;
+
+  // if enough prefix bytes are present, fill the current block and run the compression function once
+  if (in_len >= avail) {
+    // fill the rest of the block
+    while (idx_W < 128) {
+      W[:u8 idx_W] = prefix[in_ptr];
+      idx_W  += 1;
+      in_ptr += 1;
+    }
+
+    // run the compression function
+    () = #spill(prefix, in_ptr, in_len, avail);
+    Hp, W = compress(Hp, W);
+    () = #unspill(prefix, in_ptr, in_len, avail);
+
+    idx_W = 0;
+    in_len -= avail; // 'avail' number of bytes consumed
+  }
+
+  // if enough prefix bytes are present, process full blocks of prefix bytes
+  while (in_len >= 128) {
+    // fill the rest of the block
+    while (idx_W < 128) {
+      W[:u8 idx_W] = prefix[in_ptr];
+      idx_W  += 1;
+      in_ptr += 1;
+    }
+
+    // run the compression function
+    () = #spill(prefix, in_ptr, in_len);
+    Hp, W = compress(Hp, W);
+    () = #unspill(prefix, in_ptr, in_len);
+
+    idx_W = 0;
+    in_len -= 128; // 128 bytes consumed
+  }
+
+  // write the remainder of the prefix bytes to W and update idx_W
+  target = idx_W;
+  target += in_len;
+  while (idx_W < target) {
+    W[:u8 idx_W] = prefix[in_ptr];
+    idx_W  += 1;
+    in_ptr += 1;
+  }
+
+  return Hp, W, idx_W;
+}
+
+fn finish(
+  reg ptr u64[8] Hp,
+  reg ptr u64[80] W,
+  reg u64 idx_W,
+  reg u64 bits
+) -> reg ptr u64[8], reg ptr u64[80] // -> Hp, W // W is only returned because W needs to be writable
+{
+  () = #spill(bits); // only needed at the end of the function
+
+  // set separation byte after input to 0x80
+  W[:u8 idx_W] = 0x80;
+  idx_W += 1;
+
+  // if the separation byte topped off the block, run the compression function
+  if (idx_W == 128) {
+    Hp, W = compress(Hp, W);
+    idx_W = 0;
+  }
+
+  // check whether the length encoding fits in the current block
+  if (idx_W < 128-16) { // length encoding fits in the current block
+    // set the zero padding, leaving space for the length encoding
+    while (idx_W < 128-16) {
+      W[:u8 idx_W] = 0x00;
+      idx_W += 1;
+    }
+  } else { // length encoding does NOT fit in the current block
+    // fill the rest of the block with zero padding
+    while (idx_W < 128) {
+      W[:u8 idx_W] = 0x00;
+      idx_W += 1;
+    }
+
+    // run the compression function
+    Hp, W = compress(Hp, W);
+    idx_W = 0;
+    
+    // set more zero padding, leaving space for the length encoding
+    while (idx_W < 128-16) {
+      W[:u8 idx_W] = 0x00;
+      idx_W += 1;
+    }
+  }
+
+  () = #unspill(bits);
+
+  // set the length encoding
+  // length encoding is 64 bits = 8 bytes
+  idx_W = 127;
+  while(idx_W >= 128-16) {
+    W[:u8 idx_W] = (8u) bits;
+    bits >>= 8;
+    idx_W -= 1;
+  }
+  
+  // run the compression function
+  Hp, W = compress(Hp, W);
+
+  return Hp, W;
+}
+
+fn __sha512_absorb(
+  reg ptr u8[64] out,
+  reg ptr u8[PREFIXLEN] prefix,
+  reg u64 ctx_ptr ctx_len,
+  reg u64 msg_ptr msg_len
+) -> reg ptr u8[64] // -> out
+{
+  () = #spill(out); // make space in the registers
+
+  reg ptr u64[8] Hp;
+  reg u64 bits;
+  reg u64 idx_W;
+
+  stack u64[8] H;
+  stack u64[80] W;
+
+  // compute number of message bits for the length encoding later
+  bits = PREFIXLEN;  // bytelength of the prefix
+  bits += ctx_len;   // bytelength of the context
+  bits += msg_len;   // bytelength of the message
+  bits += 2;         // account for the zero-byte and the context length
+  bits <<= 3;        // convert number of bytes to number of bits
+  () = #spill(bits); // make space in the registers
+
+  H = __SHA512_initH_ref();
+  Hp = H;
+  
+  () = #spill(ctx_ptr, ctx_len, msg_ptr, msg_len); // make space in the registers
+  
+  idx_W = 0;
+
+  // absorb the fixed-sized prefix
+  Hp, W, idx_W = absorb_fixed(Hp, W, idx_W, prefix);
+  
+  // add a zero-padding byte (preceding the context length)
+  W[:u8 idx_W] = 0x00;
+  idx_W += 1;
+
+  // if the padding byte topped off the block, run the compression function
+  if (idx_W == 128) {
+    Hp, W = compress(Hp, W);
+    idx_W = 0;
+  }
+  
+  () = #unspill(ctx_len);
+
+  // add the context length
+  W[:u8 idx_W] = (8u) ctx_len;
+  idx_W += 1;
+
+  // if the context length topped off the block, run the compression function
+  if (idx_W == 128) {
+    Hp, W = compress(Hp, W);
+    idx_W = 0;
+  }
+
+  () = #unspill(ctx_ptr);
+
+  // absorb the variable-sized context
+  Hp, W, idx_W = absorb_pointer(Hp, W, idx_W, ctx_ptr, ctx_len);
+  
+  () = #unspill(msg_ptr, msg_len);
+
+  // absorb the variable-sized message
+  Hp, W, idx_W = absorb_pointer(Hp, W, idx_W, msg_ptr, msg_len);
+
+  () = #unspill(bits);
+  Hp, W = finish(Hp, W, idx_W, bits);
+
+  H = Hp;
+  () = #unspill(out);
+  out = __SHA512_store_ref_array(out, H);
+  return out;
+}

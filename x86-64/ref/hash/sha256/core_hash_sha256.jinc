@@ -1,0 +1,41 @@
+require "common/sha256_common.jinc"
+
+namespace sha256_hmac_inner {
+    param int PREFIXLEN = SHA256_IN + SPX_N;
+    require "sha256_absorb/sha256_absorb.jinc"
+}
+
+namespace sha256_hmac_outer {
+    param int INLEN = SHA256_IN + SHA256_OUT;
+    require "sha256_array/sha256_array.jinc"
+}
+
+namespace sha256_mgf1_msg {
+    param int PREFIXLEN = 3*SPX_N;
+    require "sha256_absorb/sha256_absorb.jinc"
+}
+
+namespace sha256_mgf1_seed {
+    param int INLEN = 2*SPX_N + SHA256_OUT + 4;
+    require "sha256_array/sha256_array.jinc"
+}
+
+namespace sha256_tl_1n {
+    param int INLEN = SHA256_IN + 22 + SPX_N;
+    require "sha256_array/sha256_array.jinc"
+}
+
+namespace sha256_tl_2n {
+    param int INLEN = SHA256_IN + 22 + 2*SPX_N;
+    require "sha256_array/sha256_array.jinc"
+}
+
+namespace sha256_compress_wots {
+    param int INLEN = SHA256_IN + 22 + SPX_LEN*SPX_N;
+    require "sha256_array/sha256_array.jinc"
+}
+
+namespace sha256_compress_fors {
+    param int INLEN = SHA256_IN + 22 + SPX_K*SPX_N;
+    require "sha256_array/sha256_array.jinc"
+}

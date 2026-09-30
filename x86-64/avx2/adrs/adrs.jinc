@@ -1,0 +1,264 @@
+// translate u32[8] adrs to u8[32] bytestring
+//_JogamesHD_ Every byte from adrs is read, so it must be fully initialized
+#[safety =
+   {
+    requires = is_arr_init(adrs, 0, 4*8),
+    ensures = is_arr_init(bytes, 0, 32) && is_arr_init(adrs, 0, 4*8)
+   }
+ ]
+inline
+fn __adrs_to_bytes(
+    reg ptr u8[32] bytes,
+    reg ptr u32[8] adrs
+) -> reg ptr u8[32]
+{
+    inline int i;
+    for i=0 to 8 {
+        reg u32 temp;
+        temp = adrs[i];
+        temp = #BSWAP_32(temp);
+
+        bytes[:u32 i] = temp;
+    }
+
+    return bytes;
+}
+
+// set every word in adrs to 0
+//_JogamesHD_
+#[safety =
+   {
+    ensures = is_arr_init(adrs, 0, 4*8)
+   }
+ ]
+inline
+fn __adrs_init(
+    reg ptr u32[8] adrs
+) -> reg ptr u32[8]
+{
+    inline int i;
+    for i=0 to 4 { adrs[:u64 i] = 0; }
+    return adrs;
+}
+
+//_JogamesHD_ Every byte from adrs is read, so it must be fully initialized
+#[safety =
+   {
+    requires = is_arr_init(adrs, 0, 4*8),
+    ensures = is_arr_init(adrs_new, 0, 4*8) && is_arr_init(adrs, 0, 4*8)
+   }
+ ]
+inline
+fn __adrs_clone(
+    reg ptr u32[8] adrs_new adrs
+) -> reg ptr u32[8]
+{
+    inline int i;
+    for i=0 to 4 { adrs_new[:u64 i] = adrs[:u64 i]; }
+    return adrs_new;
+}
+
+// compress adrs to adrs^c, for SHA implementations
+//_JogamesHD_ Every byte from adrs is read, so it must be fully initialized
+#[safety =
+   {
+    requires = is_arr_init(adrs, 0, 4*8),
+    ensures = is_arr_init(out, 0, 22) && is_arr_init(adrs, 0, 4*8)
+   }
+ ]
+inline
+fn __adrs_compress(
+    reg ptr u8[22] out,
+    reg ptr u32[8] adrs
+) -> reg ptr u8[22]
+{
+    inline int i;
+
+    stack u8[32] adrs_b;
+    adrs_b = __adrs_to_bytes(adrs_b, adrs);
+
+    // ADRS^c = ADRS[3] ∥ ADRS[8 ∶ 16] ∥ ADRS[19] ∥ ADRS[20 ∶ 32]
+    out[0] = adrs_b[3];
+    for i=0 to 8 { out[i+1] = adrs_b[i+8]; }
+    out[9] = adrs_b[19];
+    for i=0 to 12 { out[i+10] = adrs_b[i+20]; }
+
+    return out;
+}
+
+////////////////////////////////
+
+//_JogamesHD_
+#[safety =
+   {
+    requires = is_arr_init(adrs, 0, 4*8) && 0 <= SPX_ADRS_OFFSET_LAYERADDR && SPX_ADRS_OFFSET_LAYERADDR <= 7,
+    ensures = is_arr_init(adrs, 0, 4*8)
+   }
+ ]
+inline
+fn __adrs_set_layer_addr(
+    reg ptr u32[8] adrs,
+    reg u32 layer
+) -> reg ptr u32[8]
+{
+    adrs[SPX_ADRS_OFFSET_LAYERADDR] = layer;
+    return adrs;
+}
+
+//_JogamesHD_ Every byte from tree is read so it must be fully initialized
+#[safety =
+   {
+    requires = is_arr_init(tree, 0, 4*3) && is_arr_init(adrs, 0, 4*8) &&
+    0 <= SPX_ADRS_OFFSET_TREEADDR && SPX_ADRS_OFFSET_TREEADDR <= 5,
+    ensures = is_arr_init(adrs, 0, 4*8) && is_arr_init(tree, 0, 4*3)
+   }
+ ]
+inline
+fn __adrs_set_tree_addr(
+    reg ptr u32[8] adrs,
+    stack u32[3] tree
+) -> reg ptr u32[8]
+{
+    // tree consists of three words, take those words one at a time
+    inline int i;
+    for i=0 to 3 { adrs[SPX_ADRS_OFFSET_TREEADDR + i] = tree[i]; }
+    return adrs;
+}
+
+//_JogamesHD_
+#[safety =
+   {
+    requires = is_arr_init(adrs, 0, 4*8) && 0 <= SPX_ADRS_OFFSET_TYPE && SPX_ADRS_OFFSET_TYPE <= 7,
+    ensures = is_arr_init(adrs, 0, 4*8)
+   }
+ ]
+inline
+fn __adrs_set_type_and_clear(
+    reg ptr u32[8] adrs,
+    inline int t
+) -> reg ptr u32[8]
+{
+    // set the last four words of adrs (including type field) to 0
+    inline int i;
+    for i=2 to 4 { adrs[:u64 i] = 0; }
+    // set type to the requested value
+    adrs[SPX_ADRS_OFFSET_TYPE] = t;
+    return adrs;
+}
+
+//_JogamesHD_
+#[safety =
+   {
+    requires = is_arr_init(adrs, 0, 4*8) && 0 <= SPX_ADRS_OFFSET_KEYPAIRADDR && SPX_ADRS_OFFSET_KEYPAIRADDR <= 7,
+    ensures = is_arr_init(adrs, 0, 4*8)
+   }
+ ]
+inline
+fn __adrs_set_key_pair_addr(
+    reg ptr u32[8] adrs,
+    reg u32 keypair
+) -> reg ptr u32[8]
+{
+    adrs[SPX_ADRS_OFFSET_KEYPAIRADDR] = keypair;
+    return adrs;
+}
+
+//_JogamesHD_
+#[safety =
+   {
+    requires = is_arr_init(adrs, 0, 4*8) && 0 <= SPX_ADRS_OFFSET_CHAINADDR && SPX_ADRS_OFFSET_CHAINADDR <= 7,
+    ensures = is_arr_init(adrs, 0, 4*8)
+   }
+ ]
+inline
+fn __adrs_set_chain_addr(
+    reg ptr u32[8] adrs,
+    reg u32 chain
+) -> reg ptr u32[8]
+{
+    adrs[SPX_ADRS_OFFSET_CHAINADDR] = chain;
+    return adrs;
+}
+
+//_JogamesHD_
+#[safety =
+   {
+    requires = is_arr_init(adrs, 0, 4*8) && 0 <= SPX_ADRS_OFFSET_TREEHEIGHT && SPX_ADRS_OFFSET_TREEHEIGHT <= 7,
+    ensures = is_arr_init(adrs, 0, 4*8)
+   }
+ ]
+inline
+fn __adrs_set_tree_height(
+    reg ptr u32[8] adrs,
+    reg u32 height
+) -> reg ptr u32[8]
+{
+    adrs[SPX_ADRS_OFFSET_TREEHEIGHT] = height;
+    return adrs;
+}
+
+//_JogamesHD_
+#[safety =
+   {
+    requires = is_arr_init(adrs, 0, 4*8) && 0 <= SPX_ADRS_OFFSET_HASHADDR && SPX_ADRS_OFFSET_HASHADDR <= 7,
+    ensures = is_arr_init(adrs, 0, 4*8)
+   }
+ ]
+inline
+fn __adrs_set_hash_addr(
+    reg ptr u32[8] adrs,
+    reg u32 hashaddr
+) -> reg ptr u32[8]
+{
+    adrs[SPX_ADRS_OFFSET_HASHADDR] = hashaddr;
+    return adrs;
+}
+
+//_JogamesHD_
+#[safety =
+   {
+    requires = is_arr_init(adrs, 0, 4*8) && 0 <= SPX_ADRS_OFFSET_TREEINDEX && SPX_ADRS_OFFSET_TREEINDEX <= 7,
+    ensures = is_arr_init(adrs, 0, 4*8)
+   }
+ ]
+inline
+fn __adrs_set_tree_index(
+    reg ptr u32[8] adrs,
+    reg u32 treeindex
+) -> reg ptr u32[8]
+{
+    adrs[SPX_ADRS_OFFSET_TREEINDEX] = treeindex;
+    return adrs;
+}
+
+//_JogamesHD_ _Question_ Should I make a statement about keypair?
+#[safety =
+   {
+    requires = is_arr_init(adrs, 0, 4*8) && 0 <= SPX_ADRS_OFFSET_KEYPAIRADDR && SPX_ADRS_OFFSET_KEYPAIRADDR <= 7,
+    ensures = is_arr_init(adrs, 0, 4*8)
+   }
+ ]
+inline
+fn __adrs_get_key_pair_addr(
+    reg ptr u32[8] adrs
+) -> reg u32
+{
+    reg u32 keypair = adrs[SPX_ADRS_OFFSET_KEYPAIRADDR];
+    return keypair;
+}
+
+//_JogamesHD_ _Question_ Should I make a statement about treeindex?
+#[safety =
+   {
+    requires = is_arr_init(adrs, 0, 4*8) && 0 <= SPX_ADRS_OFFSET_TREEINDEX && SPX_ADRS_OFFSET_TREEINDEX <= 7,
+    ensures = is_arr_init(adrs, 0, 4*8)
+   }
+ ]
+inline
+fn __adrs_get_tree_index(
+    reg ptr u32[8] adrs
+) -> reg u32
+{
+    reg u32 treeindex = adrs[SPX_ADRS_OFFSET_TREEINDEX];
+    return treeindex;
+}

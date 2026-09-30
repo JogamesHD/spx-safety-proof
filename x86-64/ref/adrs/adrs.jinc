@@ -1,0 +1,166 @@
+// translate u32[8] adrs to u8[32] bytestring
+inline
+fn __adrs_to_bytes(
+    reg ptr u8[32] bytes,
+    reg ptr u32[8] adrs
+) -> reg ptr u8[32]
+{
+    inline int i;
+    for i=0 to 8 {
+        reg u32 temp;
+        temp = adrs[i];
+        temp = #BSWAP_32(temp);
+
+        bytes[:u32 i] = temp;
+    }
+
+    return bytes;
+}
+
+// set every word in adrs to 0
+inline
+fn __adrs_init(
+    reg ptr u32[8] adrs
+) -> reg ptr u32[8]
+{
+    inline int i;
+    for i=0 to 4 { adrs[:u64 i] = 0; }
+    return adrs;
+}
+
+inline
+fn __adrs_clone(
+    reg ptr u32[8] adrs_new adrs
+) -> reg ptr u32[8]
+{
+    inline int i;
+    for i=0 to 4 { adrs_new[:u64 i] = adrs[:u64 i]; }
+    return adrs_new;
+}
+
+// compress adrs to adrs^c, for SHA implementations
+inline
+fn __adrs_compress(
+    reg ptr u8[22] out,
+    reg ptr u32[8] adrs
+) -> reg ptr u8[22]
+{
+    inline int i;
+
+    stack u8[32] adrs_b;
+    adrs_b = __adrs_to_bytes(adrs_b, adrs);
+
+    // ADRS^c = ADRS[3] ∥ ADRS[8 ∶ 16] ∥ ADRS[19] ∥ ADRS[20 ∶ 32]
+    out[0] = adrs_b[3];
+    for i=0 to 8 { out[i+1] = adrs_b[i+8]; }
+    out[9] = adrs_b[19];
+    for i=0 to 12 { out[i+10] = adrs_b[i+20]; }
+
+    return out;
+}
+
+////////////////////////////////
+
+inline
+fn __adrs_set_layer_addr(
+    reg ptr u32[8] adrs,
+    reg u32 layer
+) -> reg ptr u32[8]
+{
+    adrs[SPX_ADRS_OFFSET_LAYERADDR] = layer;
+    return adrs;
+}
+
+inline
+fn __adrs_set_tree_addr(
+    reg ptr u32[8] adrs,
+    stack u32[3] tree
+) -> reg ptr u32[8]
+{
+    // tree consists of three words, take those words one at a time
+    inline int i;
+    for i=0 to 3 { adrs[SPX_ADRS_OFFSET_TREEADDR + i] = tree[i]; }
+    return adrs;
+}
+
+inline
+fn __adrs_set_type_and_clear(
+    reg ptr u32[8] adrs,
+    inline int t
+) -> reg ptr u32[8]
+{
+    // set the last four words of adrs (including type field) to 0
+    inline int i;
+    for i=2 to 4 { adrs[:u64 i] = 0; }
+    // set type to the requested value
+    adrs[SPX_ADRS_OFFSET_TYPE] = t;
+    return adrs;
+}
+
+inline
+fn __adrs_set_key_pair_addr(
+    reg ptr u32[8] adrs,
+    reg u32 keypair
+) -> reg ptr u32[8]
+{
+    adrs[SPX_ADRS_OFFSET_KEYPAIRADDR] = keypair;
+    return adrs;
+}
+
+inline
+fn __adrs_set_chain_addr(
+    reg ptr u32[8] adrs,
+    reg u32 chain
+) -> reg ptr u32[8]
+{
+    adrs[SPX_ADRS_OFFSET_CHAINADDR] = chain;
+    return adrs;
+}
+
+inline
+fn __adrs_set_tree_height(
+    reg ptr u32[8] adrs,
+    reg u32 height
+) -> reg ptr u32[8]
+{
+    adrs[SPX_ADRS_OFFSET_TREEHEIGHT] = height;
+    return adrs;
+}
+
+inline
+fn __adrs_set_hash_addr(
+    reg ptr u32[8] adrs,
+    reg u32 hashaddr
+) -> reg ptr u32[8]
+{
+    adrs[SPX_ADRS_OFFSET_HASHADDR] = hashaddr;
+    return adrs;
+}
+
+inline
+fn __adrs_set_tree_index(
+    reg ptr u32[8] adrs,
+    reg u32 treeindex
+) -> reg ptr u32[8]
+{
+    adrs[SPX_ADRS_OFFSET_TREEINDEX] = treeindex;
+    return adrs;
+}
+
+inline
+fn __adrs_get_key_pair_addr(
+    reg ptr u32[8] adrs
+) -> reg u32
+{
+    reg u32 keypair = adrs[SPX_ADRS_OFFSET_KEYPAIRADDR];
+    return keypair;
+}
+
+inline
+fn __adrs_get_tree_index(
+    reg ptr u32[8] adrs
+) -> reg u32
+{
+    reg u32 treeindex = adrs[SPX_ADRS_OFFSET_TREEINDEX];
+    return treeindex;
+}

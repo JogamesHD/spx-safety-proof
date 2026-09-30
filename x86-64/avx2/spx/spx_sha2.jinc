@@ -1,0 +1,961 @@
+require "../active_params.jinc" // SPHINCS+ parameters
+// active_params.jinc in turn requires the chosen parameter file with the concrete parameter values
+
+require "../stdlib/memcpy/memcpy.jinc" // for copying SPX_N-byte strings
+require "../stdlib/memcmp/memcmp.jinc" // for comparing SPX_N-byte strings
+
+require "../adrs/adrs.jinc" // ADRS data structure
+
+require "../wots/wots_sha2.jinc" // algorithms 5-8   of SLH-DSS: Winternitz One-Time Signature Plus
+require "../xmss/xmss_sha2.jinc" // algorithms 9-11  of SLH-DSS: eXtended Merkle Signature Scheme
+require "../ht/ht_sha2.jinc"     // algorithms 12-13 of SLH-DSS: HyperTree
+require "../fors/fors_sha2.jinc" // algorithms 14-17 of SLH-DSS: Forest Of Random Subsets
+
+/////////////////////// HELPER FUNCTIONS ///////////////////////
+
+// turn byte arrays representing idx_tree and idx_leaf into registers
+//_JogamesHD_ Every byte from tmp_idx_tree and tmp_idx_leaf is read, so they must be fully initialized.
+//_JogamesHD_ _Question_ Does is_arr_init even work with stack u32 (instead of reg ptr)?
+//_JogamesHD_ _Question_ Do I need to make a statement about idx_leaf?
+#[safety =
+   {
+    requires = is_arr_init(tmp_idx_tree, 0, SPX_IDX_TREE_LEN) && is_arr_init(tmp_idx_leaf, 0, SPX_IDX_LEAF_LEN),
+    ensures = is_arr_init(idx_tree, 0, 4*3) && is_arr_init(tmp_idx_tree, 0, SPX_IDX_TREE_LEN) &&
+    is_arr_init(tmp_idx_leaf, 0, SPX_IDX_LEAF_LEN) &&
+    idx_leaf <= (1 << (SPX_H_PRIME)) - 1 //_JogamesHD_ Important in slh_sign_internal_
+   }
+ ]
+inline
+fn __indices_to_regs(
+    reg ptr u8[SPX_IDX_TREE_LEN] tmp_idx_tree, // byte array representing idx_tree
+    reg ptr u8[SPX_IDX_LEAF_LEN] tmp_idx_leaf  // byte array representing idx_leaf
+) -> stack u32[3], reg u32 // -> idx_tree, idx_leaf
+{
+    // stack variables
+    stack u32[3] idx_tree; // tree index output (tree index in ADRS is three 32-bit words)
+
+    // register variables
+    reg u32 idx_leaf; // leaf index output
+    reg u32 byte;     // temporary variable to convert between u8 and u32
+    reg u32 high;     // temporary variable for bitshifting
+
+    inline int i;
+
+    // initialise idx_tree to 0
+    idx_tree[0] = 0;
+    idx_tree[1] = 0;
+    idx_tree[2] = 0;
+
+    for i=0 to SPX_IDX_TREE_LEN {
+        // shift the whole 96-bit idx_tree left by 8
+
+        idx_tree[0] <<= 8;   // shift the reference word left by eight bits to make place for one byte
+        high = idx_tree[1];  // copy the word to the right
+        high >>= 24;         // take the leftmost byte of that word
+        idx_tree[0] |= high; // insert that leftmost byte into the reference word
+
+        idx_tree[1] <<= 8;   // shift the reference word left by eight bits to make place for one byte
+        high = idx_tree[2];  // copy the word to the right
+        high >>= 24;         // take the leftmost byte of that word
+        idx_tree[1] |= high; // insert that leftmost byte into the reference word
+
+        idx_tree[2] <<= 8;  // shift the reference word left by eight bits to make place for one byte
+
+        // set the last eight bits to the next byte from the input
+        byte = (32u) tmp_idx_tree[i];
+        idx_tree[2] |= byte;
+    }
+
+    // compute idx_tree mod 2^(h-h'):
+    // since the mod is a power of two, computing the mod result is the same as performing
+    // an AND with a bitmask where the least-significant h-h' bits are 1
+    if (SPX_H-SPX_H_PRIME <= 32) {
+        idx_tree[0] = 0;
+        idx_tree[1] = 0;
+        idx_tree[2] &= (1 << (SPX_H-SPX_H_PRIME)) - 1;
+    } else if (SPX_H-SPX_H_PRIME <= 64) {
+        idx_tree[0] = 0;
+        idx_tree[1] &= (1 << (SPX_H-SPX_H_PRIME-32)) - 1;
+    } else { // SPX_H-SPX_H_PRIME <= 96
+        idx_tree[0] &= (1 << (SPX_H-SPX_H_PRIME-64)) - 1;
+    }
+
+    // initialise idx_leaf to 0
+    idx_leaf = 0;
+
+    for i=0 to SPX_IDX_LEAF_LEN {
+        idx_leaf <<= 8;               // shift the word left by eight bits to make place for one byte
+        byte = (32u) tmp_idx_leaf[i]; // take the next byte from the input
+        idx_leaf |= byte;             // set the last eight bits to the next byte from the input
+    }
+
+    // compute idx_leaf mod 2^(h'):
+    // since the mod is a power of two, computing the mod result is the same as performing
+    // an AND with a bitmask where the least-significant h-h' bits are 1
+    idx_leaf &= (1 << SPX_H_PRIME) - 1;
+
+    return idx_tree, idx_leaf;
+}
+
+//////////////////////// MAIN FUNCTIONS ////////////////////////
+
+/*-------------------------------------------------------------+
+| ALGORITHM 18 FROM SLH-DSS (FIPS 205)                         |
+| Generates an SLH-DSA key pair.                               |
++-------------------------------------------------------------*/
+//_JogamesHD_ _Question_ Do I need to make a statement about res?
+#[safety =
+   {
+    requires = is_arr_init(keyrnd, 0, 3*SPX_N) &&
+
+    SHA256_IN % 8 == 0 && //_JogamesHD_ From init_cache call
+    SHA512_IN % 8 == 0 && //_JogamesHD_ From init_cache call
+    SPX_N <= SHA256_IN && SPX_N <= SHA512_IN && //_JogamesHD_ From init_cache call
+
+    0 <= SPX_ADRS_OFFSET_TYPE && SPX_ADRS_OFFSET_TYPE <= 7 && //_JogamesHD_ From __xmss_node call
+    0 <= SPX_ADRS_OFFSET_KEYPAIRADDR && SPX_ADRS_OFFSET_KEYPAIRADDR <= 7 && //_JogamesHD_ From __xmss_node call
+    0 <= SPX_ADRS_OFFSET_CHAINADDR && SPX_ADRS_OFFSET_CHAINADDR <= 7 && //_JogamesHD_ From __xmss_node call
+    SPX_N <= 4*8 && SHA256_OUT == 32 && //_JogamesHD_ From __xmss_node call
+    SHA512_OUT == 64 && //_JogamesHD_ From __xmss_node call
+    0 <= SPX_ADRS_OFFSET_HASHADDR && SPX_ADRS_OFFSET_HASHADDR <= 7 && //_JogamesHD_ From __xmss_node call
+    SPX_LEN*SPX_N <= WOTS_SIG && //_JogamesHD_ From __xmss_node call
+    0 <= SPX_ADRS_OFFSET_TREEHEIGHT && SPX_ADRS_OFFSET_TREEHEIGHT <= 7 && //_JogamesHD_ From __xmss_node call
+    0 <= SPX_ADRS_OFFSET_TREEINDEX && SPX_ADRS_OFFSET_TREEINDEX <= 7 && //_JogamesHD_ From __xmss_node call
+    0 <= SPX_N && //_JogamesHD_ From __xmss_node call
+
+    0 <= SPX_H_PRIME && //_JogamesHD_ Technicality, to fulfill precondition of __xmss_node
+
+    0 <= SPX_ADRS_OFFSET_LAYERADDR && SPX_ADRS_OFFSET_LAYERADDR <= 7 && //_JogamesHD_ From __adrs_set_layer_addr call
+
+    4*SPX_N <= SPX_SKBYTES && //_JogamesHD_ To prevent oob access in sk
+    2*SPX_N <= SPX_PKBYTES, //_JogamesHD_ To prevent oob access in pk
+    ensures = is_arr_init(keyrnd, 0, 3*SPX_N) && is_arr_init(sk, 0, 4*SPX_N) &&
+    is_arr_init(pk, 0, 2*SPX_N)
+   }
+ ]
+fn slh_keygen_internal_(
+    reg ptr u8[SPX_SKBYTES] sk, // out: (SK.seed, SK.prf. PK.seed, PK.root)
+    reg ptr u8[SPX_PKBYTES] pk, // out: (PK.seed, PK.root)
+    reg ptr u8[3*SPX_N] keyrnd  // key randomness
+) -> reg ptr u8[SPX_SKBYTES], reg ptr u8[SPX_PKBYTES], reg u64 // -> sk, pk, res
+{
+    // stack variables
+    stack u32[8] adrs;    // ADRS data structure
+    stack u8[96] h_cache; // cached SHA2 state
+
+    // register variables
+    reg ptr u8[SPX_N] skseed pkseed pkroot; // pointers to the individual parts of sk
+    reg u32 layer; // layer value to set in ADRS
+    reg u32 i;     // horizontal index of the XMSS tree root
+    reg u32 z;     // height of the XMSS tree root
+    reg u64 res;   // indicates whether running this function was successful
+
+    sk[0*SPX_N : SPX_N] = __copy_nbytes(sk[0*SPX_N : SPX_N], keyrnd[0*SPX_N : SPX_N]); // copy SK.seed to SK
+    sk[1*SPX_N : SPX_N] = __copy_nbytes(sk[1*SPX_N : SPX_N], keyrnd[1*SPX_N : SPX_N]); // copy SK.prf  to SK
+    sk[2*SPX_N : SPX_N] = __copy_nbytes(sk[2*SPX_N : SPX_N], keyrnd[2*SPX_N : SPX_N]); // copy PK.seed to SK
+    pk[0*SPX_N : SPX_N] = __copy_nbytes(pk[0*SPX_N : SPX_N], keyrnd[2*SPX_N : SPX_N]); // copy PK.seed to PK
+
+    // get the pointers to the individual parts of sk and pk
+    skseed = sk[0*SPX_N : SPX_N];
+    pkseed = sk[2*SPX_N : SPX_N];
+
+    // compute the SHA256 state after consuming exactly one block of input,
+    // as that state is the same for all PRF, F, H, T_len, and T_k hash calls,
+    // with any differences only being present in the second block onwards
+    () = #spill(sk, pk, skseed);
+    h_cache = init_cache(h_cache, pkseed);
+    () = #unspill(sk, pk, skseed);
+
+    // initialise ADRS to the all-zero string
+    adrs = __adrs_init(adrs);
+
+    // set the layer address to the highest hypertree layer
+    layer = SPX_D-1;
+    adrs  = __adrs_set_layer_addr(adrs, layer);
+
+    // compute PK.root, which is the node in the top-most XMSS tree at
+    // horizontal index i = 0 and height z = SPX_H_PRIME
+    i = 0;
+    z = SPX_H_PRIME;
+
+    pkroot = sk[3*SPX_N : SPX_N]; // get the pointer to the subarray so the full array can be spilled
+    () = #spill(sk, pk);
+    pkroot, adrs = __xmss_node(pkroot, skseed, i, z, adrs, h_cache);
+    () = #unspill(sk, pk);
+    sk[3*SPX_N : SPX_N] = pkroot; // redesignate the pointer so the region of the full array is not partial
+
+    pk[SPX_N : SPX_N] = __copy_nbytes(pk[SPX_N : SPX_N], pkroot[0 : SPX_N]); // copy PK.root to PK
+
+    res = 0; // set return value to 0 (successful)
+    return sk, pk, res;
+}
+
+//_JogamesHD_ Wrapper
+#[safety =
+   {
+    requires = is_arr_init(keyrnd, 0, 3*SPX_N) &&
+
+    SHA256_IN % 8 == 0 && //_JogamesHD_ From init_cache call
+    SHA512_IN % 8 == 0 && //_JogamesHD_ From init_cache call
+    SPX_N <= SHA256_IN && SPX_N <= SHA512_IN && //_JogamesHD_ From init_cache call
+
+    0 <= SPX_ADRS_OFFSET_TYPE && SPX_ADRS_OFFSET_TYPE <= 7 && //_JogamesHD_ From __xmss_node call
+    0 <= SPX_ADRS_OFFSET_KEYPAIRADDR && SPX_ADRS_OFFSET_KEYPAIRADDR <= 7 && //_JogamesHD_ From __xmss_node call
+    0 <= SPX_ADRS_OFFSET_CHAINADDR && SPX_ADRS_OFFSET_CHAINADDR <= 7 && //_JogamesHD_ From __xmss_node call
+    SPX_N <= 4*8 && SHA256_OUT == 32 && //_JogamesHD_ From __xmss_node call
+    SHA512_OUT == 64 && //_JogamesHD_ From __xmss_node call
+    0 <= SPX_ADRS_OFFSET_HASHADDR && SPX_ADRS_OFFSET_HASHADDR <= 7 && //_JogamesHD_ From __xmss_node call
+    SPX_LEN*SPX_N <= WOTS_SIG && //_JogamesHD_ From __xmss_node call
+    0 <= SPX_ADRS_OFFSET_TREEHEIGHT && SPX_ADRS_OFFSET_TREEHEIGHT <= 7 && //_JogamesHD_ From __xmss_node call
+    0 <= SPX_ADRS_OFFSET_TREEINDEX && SPX_ADRS_OFFSET_TREEINDEX <= 7 && //_JogamesHD_ From __xmss_node call
+    0 <= SPX_N && //_JogamesHD_ From __xmss_node call
+
+    0 <= SPX_H_PRIME && //_JogamesHD_ Technicality, to fulfill precondition of __xmss_node
+
+    0 <= SPX_ADRS_OFFSET_LAYERADDR && SPX_ADRS_OFFSET_LAYERADDR <= 7 && //_JogamesHD_ From __adrs_set_layer_addr call
+
+    4*SPX_N <= SPX_SKBYTES && //_JogamesHD_ To prevent oob access in sk
+    2*SPX_N <= SPX_PKBYTES, //_JogamesHD_ To prevent oob access in pk
+    ensures = is_arr_init(keyrnd, 0, 3*SPX_N) && is_arr_init(sk, 0, 4*SPX_N) &&
+    is_arr_init(pk, 0, 2*SPX_N)
+   }
+ ]
+inline // inline wrapper that splits parameter live-ranges, to aid the Jasmin compiler
+fn __slh_keygen_internal(
+    reg ptr u8[SPX_SKBYTES] sk, // out: (SK.seed, SK.prf. PK.seed, PK.root)
+    reg ptr u8[SPX_PKBYTES] pk, // out: (PK.seed, PK.root)
+    reg ptr u8[3*SPX_N] keyrnd  // key randomness
+) -> reg ptr u8[SPX_SKBYTES], reg ptr u8[SPX_PKBYTES], reg u64 // -> sk, pk
+{
+    // split live-range of the input parameters into two segments
+    sk = sk; pk = pk; keyrnd = keyrnd;
+
+    reg u64 res;
+    sk, pk, res = slh_keygen_internal_(sk, pk, keyrnd);
+
+    // split live-range of the output parameters into two segments
+    sk = sk; pk = pk; res = res;
+
+    return sk, pk, res;
+}
+
+//_JogamesHD_ Same as __slh_keygen_internal
+#[safety =
+   {
+    requires = is_arr_init(keyrnd, 0, 3*SPX_N) &&
+
+    SHA256_IN % 8 == 0 && //_JogamesHD_ From init_cache call
+    SHA512_IN % 8 == 0 && //_JogamesHD_ From init_cache call
+    SPX_N <= SHA256_IN && SPX_N <= SHA512_IN && //_JogamesHD_ From init_cache call
+
+    0 <= SPX_ADRS_OFFSET_TYPE && SPX_ADRS_OFFSET_TYPE <= 7 && //_JogamesHD_ From __xmss_node call
+    0 <= SPX_ADRS_OFFSET_KEYPAIRADDR && SPX_ADRS_OFFSET_KEYPAIRADDR <= 7 && //_JogamesHD_ From __xmss_node call
+    0 <= SPX_ADRS_OFFSET_CHAINADDR && SPX_ADRS_OFFSET_CHAINADDR <= 7 && //_JogamesHD_ From __xmss_node call
+    SPX_N <= 4*8 && SHA256_OUT == 32 && //_JogamesHD_ From __xmss_node call
+    SHA512_OUT == 64 && //_JogamesHD_ From __xmss_node call
+    0 <= SPX_ADRS_OFFSET_HASHADDR && SPX_ADRS_OFFSET_HASHADDR <= 7 && //_JogamesHD_ From __xmss_node call
+    SPX_LEN*SPX_N <= WOTS_SIG && //_JogamesHD_ From __xmss_node call
+    0 <= SPX_ADRS_OFFSET_TREEHEIGHT && SPX_ADRS_OFFSET_TREEHEIGHT <= 7 && //_JogamesHD_ From __xmss_node call
+    0 <= SPX_ADRS_OFFSET_TREEINDEX && SPX_ADRS_OFFSET_TREEINDEX <= 7 && //_JogamesHD_ From __xmss_node call
+    0 <= SPX_N && //_JogamesHD_ From __xmss_node call
+
+    0 <= SPX_H_PRIME && //_JogamesHD_ Technicality, to fulfill precondition of __xmss_node
+
+    0 <= SPX_ADRS_OFFSET_LAYERADDR && SPX_ADRS_OFFSET_LAYERADDR <= 7 && //_JogamesHD_ From __adrs_set_layer_addr call
+
+    4*SPX_N <= SPX_SKBYTES && //_JogamesHD_ To prevent oob access in sk
+    2*SPX_N <= SPX_PKBYTES, //_JogamesHD_ To prevent oob access in pk
+    ensures = is_arr_init(keyrnd, 0, 3*SPX_N) && is_arr_init(sk, 0, 4*SPX_N) &&
+    is_arr_init(pk, 0, 2*SPX_N)
+   }
+ ]
+export // this function is visible to the outside after compilation
+// it's the same as __slh_keygen_internal, but separated to prevent
+// the warning 'warning: export function will be inlined'
+fn slh_keygen_internal_avx2(
+    reg ptr u8[SPX_SKBYTES] sk, // out: (SK.seed, SK.prf. PK.seed, PK.root)
+    reg ptr u8[SPX_PKBYTES] pk, // out: (PK.seed, PK.root)
+    reg ptr u8[3*SPX_N] keyrnd  // key randomness
+) -> reg ptr u8[SPX_SKBYTES], reg ptr u8[SPX_PKBYTES], reg u64 // -> sk, pk
+{
+    // split live-range of the input parameters into two segments
+    sk = sk; pk = pk; keyrnd = keyrnd;
+
+    reg u64 res;
+    sk, pk, res = slh_keygen_internal_(sk, pk, keyrnd);
+
+    // split live-range of the output parameters into two segments
+    sk = sk; pk = pk; res = res;
+
+    return sk, pk, res;
+}
+
+/*-------------------------------------------------------------+
+| ALGORITHM 19 FROM SLH-DSS (FIPS 205)                         |
+| Generates an SLH-DSA signature.                              |
++-------------------------------------------------------------*/
+//_JogamesHD_ Every byte from ctx_msg_ptrs and ctx_msg_lens is read, so they must be fully initialized.
+//_JogamesHD_ 4*SPX_N bytes are read from sk, so 4*SPX_N bytes must be initialized.
+//_JogamesHD_ _Question_ Or would it be better to do something like 4*SPX_N == SPX_SKBYTES?
+//_JogamesHD_ addrnd is handed to PRF_msg, which itself calls __copy_nbytes, which requires initialized
+//_JogamesHD_ inputs (as far as I can tell).
+//_JogamesHD_ _Question_ Do I need to make a statement about res?
+//_JogamesHD_ _Question_ Would need a bound on ctx_len and msg_len but idk if that is possible, as they
+//_JogamesHD_ are extracted from an array
+#[safety =
+   {
+    requires = (SHA2_VERSION == 512) ? (is_arr_init(ctx_msg_ptrs, 0, 8*2) && is_arr_init(ctx_msg_lens, 0, 8*2) &&
+    is_arr_init(sk, 0, 4*SPX_N) && is_arr_init(addrnd, 0, SPX_N) &&
+    4*SPX_N <= SPX_SKBYTES && //_JogamesHD_ To prevent oob access in sk
+    SPX_MD_LEN + SPX_IDX_TREE_LEN + SPX_IDX_LEAF_LEN <= SPX_M && //_JogamesHD_ To prevent oob access in digest
+    SPX_N + FORS_SIG + HT_SIG <= SPX_SIG && //_JogamesHD_ To prevent oob access in sig_slh
+    ((SPX_LEN_1 * SPX_LG_W + 7) / 8) <= SPX_N && //_JogamesHD_ From __ht_sign call
+    SPX_LEN_1 <= SPX_LEN && (SPX_LEN_1 + SPX_LEN_2) == SPX_LEN && //_JogamesHD_ From __ht_sign call
+    0 <= SPX_ADRS_OFFSET_TYPE && SPX_ADRS_OFFSET_TYPE <= 7 && //_JogamesHD_ From __ht_sign call
+    0 <= SPX_ADRS_OFFSET_KEYPAIRADDR && SPX_ADRS_OFFSET_KEYPAIRADDR <= 7 && //_JogamesHD_ From __ht_sign call
+    0 <= SPX_ADRS_OFFSET_CHAINADDR && SPX_ADRS_OFFSET_CHAINADDR <= 7 && //_JogamesHD_ From __ht_sign call
+    0 <= SPX_ADRS_OFFSET_HASHADDR && SPX_ADRS_OFFSET_HASHADDR <= 7 && //_JogamesHD_ From __ht_sign call
+    SPX_N <= 4*8 && SHA256_OUT == 32 && //_JogamesHD_ From __ht_sign call
+    SHA512_OUT == 64 && //_JogamesHD_ From __ht_sign call
+    SPX_LEN*SPX_N <= WOTS_SIG && //_JogamesHD_ From __ht_sign call
+    0 <= SPX_ADRS_OFFSET_TREEINDEX && SPX_ADRS_OFFSET_TREEINDEX <= 7 && //_JogamesHD_ From __ht_sign call
+    0 <= SPX_ADRS_OFFSET_TREEHEIGHT && SPX_ADRS_OFFSET_TREEHEIGHT <= 7 && //_JogamesHD_ From __ht_sign call
+    WOTS_SIG + SPX_N*SPX_H_PRIME <= XMSS_SIG && //_JogamesHD_ From __ht_sign call
+    0 <= SPX_N && //_JogamesHD_ From __ht_sign call
+    0 <= SPX_ADRS_OFFSET_TREEADDR && SPX_ADRS_OFFSET_TREEADDR <= 5 && //_JogamesHD_ From __ht_sign call
+    0 <= SPX_ADRS_OFFSET_LAYERADDR && SPX_ADRS_OFFSET_LAYERADDR <= 7 && //_JogamesHD_ From __ht_sign call
+    XMSS_SIG*SPX_D <= HT_SIG && //_JogamesHD_ From __ht_sign call
+    (SPX_A + 1)*SPX_K*SPX_N <= FORS_SIG && //_JogamesHD_ From __fors_pkfromsig call
+    128 <= 3*SPX_N && //_JogamesHD_ From __H_msg call (Replaced PREFIXLEN)
+    128 <= SHA512_IN + SPX_N && //_JogamesHD_ From __PRF_msg call (Replaced PREFIXLEN)
+    SPX_N <= SHA512_IN && //_JogamesHD_ From __PRF_msg call
+    (SHA512_IN % 8) == 0 && SPX_N <= SHA512_OUT && //_JogamesHD_ From __PRF_msg call
+    SPX_N <= SHA256_IN && SPX_N <= SHA512_IN && //_JogamesHD_ From init_cache call
+    SHA512_IN % 8 == 0 && SHA256_IN % 8 == 0) //_JogamesHD_ From init_cache call
+    : (is_arr_init(ctx_msg_ptrs, 0, 8*2) && is_arr_init(ctx_msg_lens, 0, 8*2) &&
+    is_arr_init(sk, 0, 4*SPX_N) && is_arr_init(addrnd, 0, SPX_N) &&
+    4*SPX_N <= SPX_SKBYTES && //_JogamesHD_ To prevent oob access in sk
+    SPX_MD_LEN + SPX_IDX_TREE_LEN + SPX_IDX_LEAF_LEN <= SPX_M && //_JogamesHD_ To prevent oob access in digest
+    SPX_N + FORS_SIG + HT_SIG <= SPX_SIG && //_JogamesHD_ To prevent oob access in sig_slh
+    ((SPX_LEN_1 * SPX_LG_W + 7) / 8) <= SPX_N && //_JogamesHD_ From __ht_sign call
+    SPX_LEN_1 <= SPX_LEN && (SPX_LEN_1 + SPX_LEN_2) == SPX_LEN && //_JogamesHD_ From __ht_sign call
+    0 <= SPX_ADRS_OFFSET_TYPE && SPX_ADRS_OFFSET_TYPE <= 7 && //_JogamesHD_ From __ht_sign call
+    0 <= SPX_ADRS_OFFSET_KEYPAIRADDR && SPX_ADRS_OFFSET_KEYPAIRADDR <= 7 && //_JogamesHD_ From __ht_sign call
+    0 <= SPX_ADRS_OFFSET_CHAINADDR && SPX_ADRS_OFFSET_CHAINADDR <= 7 && //_JogamesHD_ From __ht_sign call
+    0 <= SPX_ADRS_OFFSET_HASHADDR && SPX_ADRS_OFFSET_HASHADDR <= 7 && //_JogamesHD_ From __ht_sign call
+    SPX_N <= 4*8 && SHA256_OUT == 32 && //_JogamesHD_ From __ht_sign call
+    SHA512_OUT == 64 && //_JogamesHD_ From __ht_sign call
+    SPX_LEN*SPX_N <= WOTS_SIG && //_JogamesHD_ From __ht_sign call
+    0 <= SPX_ADRS_OFFSET_TREEINDEX && SPX_ADRS_OFFSET_TREEINDEX <= 7 && //_JogamesHD_ From __ht_sign call
+    0 <= SPX_ADRS_OFFSET_TREEHEIGHT && SPX_ADRS_OFFSET_TREEHEIGHT <= 7 && //_JogamesHD_ From __ht_sign call
+    WOTS_SIG + SPX_N*SPX_H_PRIME <= XMSS_SIG && //_JogamesHD_ From __ht_sign call
+    0 <= SPX_N && //_JogamesHD_ From __ht_sign call
+    0 <= SPX_ADRS_OFFSET_TREEADDR && SPX_ADRS_OFFSET_TREEADDR <= 5 && //_JogamesHD_ From __ht_sign call
+    0 <= SPX_ADRS_OFFSET_LAYERADDR && SPX_ADRS_OFFSET_LAYERADDR <= 7 && //_JogamesHD_ From __ht_sign call
+    XMSS_SIG*SPX_D <= HT_SIG && //_JogamesHD_ From __ht_sign call
+    (SPX_A + 1)*SPX_K*SPX_N <= FORS_SIG && //_JogamesHD_ From __fors_pkfromsig call
+    64 <= 3*SPX_N && //_JogamesHD_ From __H_msg call (Replaced PREFIXLEN)
+    64 <= SHA256_IN + SPX_N && //_JogamesHD_ From __PRF_msg call (Replaced PREFIXLEN)
+    SPX_N <= SHA256_IN && //_JogamesHD_ From __PRF_msg call
+    (SHA256_IN % 8) == 0 && SPX_N <= SHA256_OUT && 32 == SHA256_OUT && //_JogamesHD_ From __PRF_msg call
+    SPX_N <= SHA256_IN && //_JogamesHD_ From init_cache call
+    SHA256_IN % 8 == 0), //_JogamesHD_ From init_cache call
+
+    ensures = is_arr_init(sig_slh, 0, SPX_N + FORS_SIG + HT_SIG) &&
+    is_arr_init(ctx_msg_ptrs, 0, 8*2) && is_arr_init(ctx_msg_lens, 0, 8*2) &&
+    is_arr_init(sk, 0, 4*SPX_N) && is_arr_init(addrnd, 0, SPX_N)
+   }
+ ]
+fn slh_sign_internal_(
+    reg ptr u8[SPX_SIG] sig_slh, // out: SPHINCS+ signature
+    reg ptr u64[2] ctx_msg_ptrs, // context and message pointers
+    reg ptr u64[2] ctx_msg_lens, // context and message lengths
+    reg ptr u8[SPX_SKBYTES] sk,  // secret key
+    reg ptr u8[SPX_N] addrnd     // additional randomness
+) -> reg ptr u8[SPX_SIG], reg u64 // -> sig_slh, res
+{
+    // stack variables
+    stack u32[8] adrs;       // ADRS data structure
+    stack u8[SPX_N] pk_fors; // FORS public key
+    stack u8[SPX_M] digest;  // full message digest from H_msg
+    stack u32[3] idx_tree;   // tree index selecting a lowest-layer XMSS tree to sign with
+    stack u8[96] h_cache;    // cached SHA2 state
+
+    // reg variables
+    reg ptr u8[SPX_MD_LEN] md;                 // digest bytes allocated to determine FORS leaf indices
+    reg ptr u8[SPX_IDX_TREE_LEN] tmp_idx_tree; // digest bytes allocated to determine idx_tree
+    reg ptr u8[SPX_IDX_LEAF_LEN] tmp_idx_leaf; // digest bytes allocated to determine idx_leaf
+    reg ptr u8[SPX_N] skseed skprf;  // pointers to the individual parts of sk
+    reg ptr u8[SPX_N] pkseed pkroot; // pointers to the individual parts of pk
+    reg ptr u8[SPX_N] r;             // message randomiser
+    reg ptr u8[HT_SIG] sig_ht;       // hypertree part of the signature
+    reg ptr u8[FORS_SIG] sig_fors;   // FORS part of the signature
+    reg u64 ctx_ptr ctx_len;         // pointers to the context string and context length
+    reg u64 msg_ptr msg_len;         // pointers to the message string and message length
+    reg u64 res;                     // indicates whether running this function was successful
+    reg u32 idx_leaf;                // leaf index selecting a leaf within a lowest-layer XMSS tree to sign with
+
+    // initialise ADRS to the all-zero string
+    adrs = __adrs_init(adrs);
+
+    // extract the message and context pointers and lengths from the combined context-message parameters
+    ctx_ptr = ctx_msg_ptrs[0];
+    msg_ptr = ctx_msg_ptrs[1];
+    ctx_len = ctx_msg_lens[0];
+    msg_len = ctx_msg_lens[1];
+
+    // set aside the register values for the H_msg call
+    () = #spill(ctx_ptr, ctx_len, msg_ptr, msg_len);
+
+    // separate SK.prf from the overall secret key
+    skprf = sk[1*SPX_N : SPX_N];
+
+    // compute the message randomiser r
+    r = sig_slh[0 : SPX_N];  // get the pointer to the subarray so the full array can be spilled
+    () = #spill(sig_slh, sk);
+    r = __PRF_msg(r, skprf, addrnd, ctx_ptr, ctx_len, msg_ptr, msg_len);
+    () = #unspill(sig_slh, sk);
+    sig_slh[0 : SPX_N] = r;  // redesignate the pointer so the region of the full array is not partial
+
+    () = #unspill(ctx_ptr, ctx_len, msg_ptr, msg_len);
+
+    // separate PK.seed and PK.root from the overall secret key
+    pkseed = sk[2*SPX_N : SPX_N];
+    pkroot = sk[3*SPX_N : SPX_N];
+
+    // compute the message digest
+    () = #spill(pkseed, sig_slh, sk);
+    digest = __H_msg(digest, r, pkseed, pkroot, ctx_ptr, ctx_len, msg_ptr, msg_len);
+    () = #unspill(pkseed, sig_slh, sk);
+
+    // separate the message digest into disjoint bytestrings needed for individual processing
+    md           = digest[0                             : SPX_MD_LEN      ];
+    tmp_idx_tree = digest[SPX_MD_LEN                    : SPX_IDX_TREE_LEN];
+    tmp_idx_leaf = digest[SPX_MD_LEN + SPX_IDX_TREE_LEN : SPX_IDX_LEAF_LEN];
+
+    // turn the tmp_idx_tree and tmp_idx_leaf bytestrings into register values
+    idx_tree, idx_leaf = __indices_to_regs(tmp_idx_tree, tmp_idx_leaf);
+
+    // set the ADRS values for the FORS signature generation
+    adrs = __adrs_set_tree_addr(adrs, idx_tree);     // lowest-layer tree index of the XMSS tree that will sign the FORS public key
+    adrs = __adrs_set_type_and_clear(adrs, SPX_ADRS_TYPE_FORS_TREE);
+    adrs = __adrs_set_key_pair_addr(adrs, idx_leaf); // Leaf index of the XMSS tree that will sign the FORS public key
+
+    // separate SK.seed from the overall secret key
+    skseed = sk[0*SPX_N : SPX_N];
+
+    // compute the SHA256 state after consuming exactly one block of input,
+    // as that state is the same for all PRF, F, H, T_len, and T_k hash calls,
+    // with any differences only being present in the second block onwards
+    () = #spill(skseed, sig_slh, md, idx_leaf);
+    h_cache = init_cache(h_cache, pkseed);
+    () = #unspill(skseed, sig_slh, md, idx_leaf);
+
+    // compute the FORS signature
+    sig_fors = sig_slh[SPX_N : FORS_SIG]; // get the pointer to the subarray so the full array can be spilled
+    () = #spill(skseed, sig_slh, md, idx_leaf);
+    sig_fors, adrs = __fors_sign(sig_fors, md, skseed, adrs, h_cache);
+    () = #unspill(skseed, sig_slh, md, idx_leaf);
+    sig_slh[SPX_N : FORS_SIG] = sig_fors; // redesignate the pointer so the region of the full array is not partial
+
+    // compute the FORS public key based on the FORS signature
+    () = #spill(skseed, sig_slh, idx_leaf);
+    pk_fors, adrs = __fors_pkfromsig(pk_fors, sig_fors, md, adrs, h_cache);
+    () = #unspill(skseed, sig_slh, idx_leaf);
+
+    // compute the hypertree signature on the FORS public key
+    sig_ht = sig_slh[SPX_N + FORS_SIG : HT_SIG]; // get the pointer to the subarray so the full array can be spilled
+    () = #spill(skseed, sig_slh);
+    sig_ht = __ht_sign(sig_ht, pk_fors, skseed, idx_tree, idx_leaf, h_cache);
+    () = #unspill(skseed, sig_slh);
+    sig_slh[SPX_N + FORS_SIG : HT_SIG] = sig_ht; // redesignate the pointer so the region of the full array is not partial
+
+    res = 0; // set return value to 0 (successful)
+    return sig_slh, res;
+}
+
+//_JogamesHD_ Wrapper
+#[safety =
+   {
+    requires = (SHA2_VERSION == 512) ? (is_arr_init(ctx_msg_ptrs, 0, 8*2) && is_arr_init(ctx_msg_lens, 0, 8*2) &&
+    is_arr_init(sk, 0, 4*SPX_N) && is_arr_init(addrnd, 0, SPX_N) &&
+    4*SPX_N <= SPX_SKBYTES && //_JogamesHD_ To prevent oob access in sk
+    SPX_MD_LEN + SPX_IDX_TREE_LEN + SPX_IDX_LEAF_LEN <= SPX_M && //_JogamesHD_ To prevent oob access in digest
+    SPX_N + FORS_SIG + HT_SIG <= SPX_SIG && //_JogamesHD_ To prevent oob access in sig_slh
+    ((SPX_LEN_1 * SPX_LG_W + 7) / 8) <= SPX_N && //_JogamesHD_ From __ht_sign call
+    SPX_LEN_1 <= SPX_LEN && (SPX_LEN_1 + SPX_LEN_2) == SPX_LEN && //_JogamesHD_ From __ht_sign call
+    0 <= SPX_ADRS_OFFSET_TYPE && SPX_ADRS_OFFSET_TYPE <= 7 && //_JogamesHD_ From __ht_sign call
+    0 <= SPX_ADRS_OFFSET_KEYPAIRADDR && SPX_ADRS_OFFSET_KEYPAIRADDR <= 7 && //_JogamesHD_ From __ht_sign call
+    0 <= SPX_ADRS_OFFSET_CHAINADDR && SPX_ADRS_OFFSET_CHAINADDR <= 7 && //_JogamesHD_ From __ht_sign call
+    0 <= SPX_ADRS_OFFSET_HASHADDR && SPX_ADRS_OFFSET_HASHADDR <= 7 && //_JogamesHD_ From __ht_sign call
+    SPX_N <= 4*8 && SHA256_OUT == 32 && //_JogamesHD_ From __ht_sign call
+    SHA512_OUT == 64 && //_JogamesHD_ From __ht_sign call
+    SPX_LEN*SPX_N <= WOTS_SIG && //_JogamesHD_ From __ht_sign call
+    0 <= SPX_ADRS_OFFSET_TREEINDEX && SPX_ADRS_OFFSET_TREEINDEX <= 7 && //_JogamesHD_ From __ht_sign call
+    0 <= SPX_ADRS_OFFSET_TREEHEIGHT && SPX_ADRS_OFFSET_TREEHEIGHT <= 7 && //_JogamesHD_ From __ht_sign call
+    WOTS_SIG + SPX_N*SPX_H_PRIME <= XMSS_SIG && //_JogamesHD_ From __ht_sign call
+    0 <= SPX_N && //_JogamesHD_ From __ht_sign call
+    0 <= SPX_ADRS_OFFSET_TREEADDR && SPX_ADRS_OFFSET_TREEADDR <= 5 && //_JogamesHD_ From __ht_sign call
+    0 <= SPX_ADRS_OFFSET_LAYERADDR && SPX_ADRS_OFFSET_LAYERADDR <= 7 && //_JogamesHD_ From __ht_sign call
+    XMSS_SIG*SPX_D <= HT_SIG && //_JogamesHD_ From __ht_sign call
+    (SPX_A + 1)*SPX_K*SPX_N <= FORS_SIG && //_JogamesHD_ From __fors_pkfromsig call
+    128 <= 3*SPX_N && //_JogamesHD_ From __H_msg call (Replaced PREFIXLEN)
+    128 <= SHA512_IN + SPX_N && //_JogamesHD_ From __PRF_msg call (Replaced PREFIXLEN)
+    SPX_N <= SHA512_IN && //_JogamesHD_ From __PRF_msg call
+    (SHA512_IN % 8) == 0 && SPX_N <= SHA512_OUT && //_JogamesHD_ From __PRF_msg call
+    SPX_N <= SHA256_IN && SPX_N <= SHA512_IN && //_JogamesHD_ From init_cache call
+    SHA512_IN % 8 == 0 && SHA256_IN % 8 == 0) //_JogamesHD_ From init_cache call
+    : (is_arr_init(ctx_msg_ptrs, 0, 8*2) && is_arr_init(ctx_msg_lens, 0, 8*2) &&
+    is_arr_init(sk, 0, 4*SPX_N) && is_arr_init(addrnd, 0, SPX_N) &&
+    4*SPX_N <= SPX_SKBYTES && //_JogamesHD_ To prevent oob access in sk
+    SPX_MD_LEN + SPX_IDX_TREE_LEN + SPX_IDX_LEAF_LEN <= SPX_M && //_JogamesHD_ To prevent oob access in digest
+    SPX_N + FORS_SIG + HT_SIG <= SPX_SIG && //_JogamesHD_ To prevent oob access in sig_slh
+    ((SPX_LEN_1 * SPX_LG_W + 7) / 8) <= SPX_N && //_JogamesHD_ From __ht_sign call
+    SPX_LEN_1 <= SPX_LEN && (SPX_LEN_1 + SPX_LEN_2) == SPX_LEN && //_JogamesHD_ From __ht_sign call
+    0 <= SPX_ADRS_OFFSET_TYPE && SPX_ADRS_OFFSET_TYPE <= 7 && //_JogamesHD_ From __ht_sign call
+    0 <= SPX_ADRS_OFFSET_KEYPAIRADDR && SPX_ADRS_OFFSET_KEYPAIRADDR <= 7 && //_JogamesHD_ From __ht_sign call
+    0 <= SPX_ADRS_OFFSET_CHAINADDR && SPX_ADRS_OFFSET_CHAINADDR <= 7 && //_JogamesHD_ From __ht_sign call
+    0 <= SPX_ADRS_OFFSET_HASHADDR && SPX_ADRS_OFFSET_HASHADDR <= 7 && //_JogamesHD_ From __ht_sign call
+    SPX_N <= 4*8 && SHA256_OUT == 32 && //_JogamesHD_ From __ht_sign call
+    SHA512_OUT == 64 && //_JogamesHD_ From __ht_sign call
+    SPX_LEN*SPX_N <= WOTS_SIG && //_JogamesHD_ From __ht_sign call
+    0 <= SPX_ADRS_OFFSET_TREEINDEX && SPX_ADRS_OFFSET_TREEINDEX <= 7 && //_JogamesHD_ From __ht_sign call
+    0 <= SPX_ADRS_OFFSET_TREEHEIGHT && SPX_ADRS_OFFSET_TREEHEIGHT <= 7 && //_JogamesHD_ From __ht_sign call
+    WOTS_SIG + SPX_N*SPX_H_PRIME <= XMSS_SIG && //_JogamesHD_ From __ht_sign call
+    0 <= SPX_N && //_JogamesHD_ From __ht_sign call
+    0 <= SPX_ADRS_OFFSET_TREEADDR && SPX_ADRS_OFFSET_TREEADDR <= 5 && //_JogamesHD_ From __ht_sign call
+    0 <= SPX_ADRS_OFFSET_LAYERADDR && SPX_ADRS_OFFSET_LAYERADDR <= 7 && //_JogamesHD_ From __ht_sign call
+    XMSS_SIG*SPX_D <= HT_SIG && //_JogamesHD_ From __ht_sign call
+    (SPX_A + 1)*SPX_K*SPX_N <= FORS_SIG && //_JogamesHD_ From __fors_pkfromsig call
+    64 <= 3*SPX_N && //_JogamesHD_ From __H_msg call (Replaced PREFIXLEN)
+    64 <= SHA256_IN + SPX_N && //_JogamesHD_ From __PRF_msg call (Replaced PREFIXLEN)
+    SPX_N <= SHA256_IN && //_JogamesHD_ From __PRF_msg call
+    (SHA256_IN % 8) == 0 && SPX_N <= SHA256_OUT && 32 == SHA256_OUT && //_JogamesHD_ From __PRF_msg call
+    SPX_N <= SHA256_IN && //_JogamesHD_ From init_cache call
+    SHA256_IN % 8 == 0), //_JogamesHD_ From init_cache call
+
+    ensures = is_arr_init(sig_slh, 0, SPX_N + FORS_SIG + HT_SIG) &&
+    is_arr_init(ctx_msg_ptrs, 0, 8*2) && is_arr_init(ctx_msg_lens, 0, 8*2) &&
+    is_arr_init(sk, 0, 4*SPX_N) && is_arr_init(addrnd, 0, SPX_N)
+   }
+ ]
+inline // inline wrapper that splits parameter live-ranges, to aid the Jasmin compiler
+fn __slh_sign_internal(
+    reg ptr u8[SPX_SIG] sig_slh, // out: SPHINCS+ signature
+    reg ptr u64[2] ctx_msg_ptrs, // context and message pointers
+    reg ptr u64[2] ctx_msg_lens, // context and message lengths
+    reg ptr u8[SPX_SKBYTES] sk,  // secret key
+    reg ptr u8[SPX_N] addrnd     // additional randomness
+) -> reg ptr u8[SPX_SIG], reg u64 // -> sig_slh, res
+{
+    // split live-range of the input parameters into two segments
+    sig_slh = sig_slh; ctx_msg_ptrs = ctx_msg_ptrs; ctx_msg_lens = ctx_msg_lens; sk = sk; addrnd = addrnd;
+
+    reg u64 res;
+    sig_slh, res = slh_sign_internal_(sig_slh, ctx_msg_ptrs, ctx_msg_lens, sk, addrnd);
+
+    // split live-range of the output parameters into two segments
+    sig_slh = sig_slh; res = res;
+
+    return sig_slh, res;
+}
+
+//_JogamesHD_ Same as __slh_sign_internal
+#[safety =
+   {
+    requires = (SHA2_VERSION == 512) ? (is_arr_init(ctx_msg_ptrs, 0, 8*2) && is_arr_init(ctx_msg_lens, 0, 8*2) &&
+    is_arr_init(sk, 0, 4*SPX_N) && is_arr_init(addrnd, 0, SPX_N) &&
+    4*SPX_N <= SPX_SKBYTES && //_JogamesHD_ To prevent oob access in sk
+    SPX_MD_LEN + SPX_IDX_TREE_LEN + SPX_IDX_LEAF_LEN <= SPX_M && //_JogamesHD_ To prevent oob access in digest
+    SPX_N + FORS_SIG + HT_SIG <= SPX_SIG && //_JogamesHD_ To prevent oob access in sig_slh
+    ((SPX_LEN_1 * SPX_LG_W + 7) / 8) <= SPX_N && //_JogamesHD_ From __ht_sign call
+    SPX_LEN_1 <= SPX_LEN && (SPX_LEN_1 + SPX_LEN_2) == SPX_LEN && //_JogamesHD_ From __ht_sign call
+    0 <= SPX_ADRS_OFFSET_TYPE && SPX_ADRS_OFFSET_TYPE <= 7 && //_JogamesHD_ From __ht_sign call
+    0 <= SPX_ADRS_OFFSET_KEYPAIRADDR && SPX_ADRS_OFFSET_KEYPAIRADDR <= 7 && //_JogamesHD_ From __ht_sign call
+    0 <= SPX_ADRS_OFFSET_CHAINADDR && SPX_ADRS_OFFSET_CHAINADDR <= 7 && //_JogamesHD_ From __ht_sign call
+    0 <= SPX_ADRS_OFFSET_HASHADDR && SPX_ADRS_OFFSET_HASHADDR <= 7 && //_JogamesHD_ From __ht_sign call
+    SPX_N <= 4*8 && SHA256_OUT == 32 && //_JogamesHD_ From __ht_sign call
+    SHA512_OUT == 64 && //_JogamesHD_ From __ht_sign call
+    SPX_LEN*SPX_N <= WOTS_SIG && //_JogamesHD_ From __ht_sign call
+    0 <= SPX_ADRS_OFFSET_TREEINDEX && SPX_ADRS_OFFSET_TREEINDEX <= 7 && //_JogamesHD_ From __ht_sign call
+    0 <= SPX_ADRS_OFFSET_TREEHEIGHT && SPX_ADRS_OFFSET_TREEHEIGHT <= 7 && //_JogamesHD_ From __ht_sign call
+    WOTS_SIG + SPX_N*SPX_H_PRIME <= XMSS_SIG && //_JogamesHD_ From __ht_sign call
+    0 <= SPX_N && //_JogamesHD_ From __ht_sign call
+    0 <= SPX_ADRS_OFFSET_TREEADDR && SPX_ADRS_OFFSET_TREEADDR <= 5 && //_JogamesHD_ From __ht_sign call
+    0 <= SPX_ADRS_OFFSET_LAYERADDR && SPX_ADRS_OFFSET_LAYERADDR <= 7 && //_JogamesHD_ From __ht_sign call
+    XMSS_SIG*SPX_D <= HT_SIG && //_JogamesHD_ From __ht_sign call
+    (SPX_A + 1)*SPX_K*SPX_N <= FORS_SIG && //_JogamesHD_ From __fors_pkfromsig call
+    128 <= 3*SPX_N && //_JogamesHD_ From __H_msg call (Replaced PREFIXLEN)
+    128 <= SHA512_IN + SPX_N && //_JogamesHD_ From __PRF_msg call (Replaced PREFIXLEN)
+    SPX_N <= SHA512_IN && //_JogamesHD_ From __PRF_msg call
+    (SHA512_IN % 8) == 0 && SPX_N <= SHA512_OUT && //_JogamesHD_ From __PRF_msg call
+    SPX_N <= SHA256_IN && SPX_N <= SHA512_IN && //_JogamesHD_ From init_cache call
+    SHA512_IN % 8 == 0 && SHA256_IN % 8 == 0) //_JogamesHD_ From init_cache call
+    : (is_arr_init(ctx_msg_ptrs, 0, 8*2) && is_arr_init(ctx_msg_lens, 0, 8*2) &&
+    is_arr_init(sk, 0, 4*SPX_N) && is_arr_init(addrnd, 0, SPX_N) &&
+    4*SPX_N <= SPX_SKBYTES && //_JogamesHD_ To prevent oob access in sk
+    SPX_MD_LEN + SPX_IDX_TREE_LEN + SPX_IDX_LEAF_LEN <= SPX_M && //_JogamesHD_ To prevent oob access in digest
+    SPX_N + FORS_SIG + HT_SIG <= SPX_SIG && //_JogamesHD_ To prevent oob access in sig_slh
+    ((SPX_LEN_1 * SPX_LG_W + 7) / 8) <= SPX_N && //_JogamesHD_ From __ht_sign call
+    SPX_LEN_1 <= SPX_LEN && (SPX_LEN_1 + SPX_LEN_2) == SPX_LEN && //_JogamesHD_ From __ht_sign call
+    0 <= SPX_ADRS_OFFSET_TYPE && SPX_ADRS_OFFSET_TYPE <= 7 && //_JogamesHD_ From __ht_sign call
+    0 <= SPX_ADRS_OFFSET_KEYPAIRADDR && SPX_ADRS_OFFSET_KEYPAIRADDR <= 7 && //_JogamesHD_ From __ht_sign call
+    0 <= SPX_ADRS_OFFSET_CHAINADDR && SPX_ADRS_OFFSET_CHAINADDR <= 7 && //_JogamesHD_ From __ht_sign call
+    0 <= SPX_ADRS_OFFSET_HASHADDR && SPX_ADRS_OFFSET_HASHADDR <= 7 && //_JogamesHD_ From __ht_sign call
+    SPX_N <= 4*8 && SHA256_OUT == 32 && //_JogamesHD_ From __ht_sign call
+    SHA512_OUT == 64 && //_JogamesHD_ From __ht_sign call
+    SPX_LEN*SPX_N <= WOTS_SIG && //_JogamesHD_ From __ht_sign call
+    0 <= SPX_ADRS_OFFSET_TREEINDEX && SPX_ADRS_OFFSET_TREEINDEX <= 7 && //_JogamesHD_ From __ht_sign call
+    0 <= SPX_ADRS_OFFSET_TREEHEIGHT && SPX_ADRS_OFFSET_TREEHEIGHT <= 7 && //_JogamesHD_ From __ht_sign call
+    WOTS_SIG + SPX_N*SPX_H_PRIME <= XMSS_SIG && //_JogamesHD_ From __ht_sign call
+    0 <= SPX_N && //_JogamesHD_ From __ht_sign call
+    0 <= SPX_ADRS_OFFSET_TREEADDR && SPX_ADRS_OFFSET_TREEADDR <= 5 && //_JogamesHD_ From __ht_sign call
+    0 <= SPX_ADRS_OFFSET_LAYERADDR && SPX_ADRS_OFFSET_LAYERADDR <= 7 && //_JogamesHD_ From __ht_sign call
+    XMSS_SIG*SPX_D <= HT_SIG && //_JogamesHD_ From __ht_sign call
+    (SPX_A + 1)*SPX_K*SPX_N <= FORS_SIG && //_JogamesHD_ From __fors_pkfromsig call
+    64 <= 3*SPX_N && //_JogamesHD_ From __H_msg call (Replaced PREFIXLEN)
+    64 <= SHA256_IN + SPX_N && //_JogamesHD_ From __PRF_msg call (Replaced PREFIXLEN)
+    SPX_N <= SHA256_IN && //_JogamesHD_ From __PRF_msg call
+    (SHA256_IN % 8) == 0 && SPX_N <= SHA256_OUT && 32 == SHA256_OUT && //_JogamesHD_ From __PRF_msg call
+    SPX_N <= SHA256_IN && //_JogamesHD_ From init_cache call
+    SHA256_IN % 8 == 0), //_JogamesHD_ From init_cache call
+
+    ensures = is_arr_init(sig_slh, 0, SPX_N + FORS_SIG + HT_SIG) &&
+    is_arr_init(ctx_msg_ptrs, 0, 8*2) && is_arr_init(ctx_msg_lens, 0, 8*2) &&
+    is_arr_init(sk, 0, 4*SPX_N) && is_arr_init(addrnd, 0, SPX_N)
+   }
+ ]
+export // this function is visible to the outside after compilation
+// it's the same as __slh_sign_internal, but separated to prevent
+// the warning 'warning: export function will be inlined'
+fn slh_sign_internal_avx2(
+    reg ptr u8[SPX_SIG] sig_slh, // out: SPHINCS+ signature
+    reg ptr u64[2] ctx_msg_ptrs, // context and message pointers
+    reg ptr u64[2] ctx_msg_lens, // context and message lengths
+    reg ptr u8[SPX_SKBYTES] sk,  // secret key
+    reg ptr u8[SPX_N] addrnd     // additional randomness
+) -> reg ptr u8[SPX_SIG], reg u64 // -> sig_slh, res
+{
+    // split live-range of the input parameters into two segments
+    sig_slh = sig_slh; ctx_msg_ptrs = ctx_msg_ptrs; ctx_msg_lens = ctx_msg_lens; sk = sk; addrnd = addrnd;
+
+    reg u64 res;
+    sig_slh, res = slh_sign_internal_(sig_slh, ctx_msg_ptrs, ctx_msg_lens, sk, addrnd);
+
+    // split live-range of the output parameters into two segments
+    sig_slh = sig_slh; res = res;
+
+    return sig_slh, res;
+}
+
+/*-------------------------------------------------------------+
+| ALGORITHM 20 FROM SLH-DSS (FIPS 205)                         |
+| Verifies an SLH-DSA signature.                               |
++-------------------------------------------------------------*/
+//_JogamesHD_ Every byte from ctx_msg_ptrs and ctx_ms_lens is read, so they must be fully initialized.
+//_JogamesHD_ SPX_N + FORS_SIG + HT_SIG bytes from sig_slh are read, so they must be initialized.
+//_JogamesHD_ _Question_ Or would something like SPX_N + FORS_SIG + HT_SIG == SPX_SIG be better?
+//_JogamesHD_ 2*SPX_N bytes are read from pk, so they must be initialized.
+//_JogamesHD_ _Question_ Or would something like 2*SPX_N == SPX_PKBYTES be better?
+//_JogamesHD_ _Question_ Do I need to make a statement about res?
+#[safety =
+   {
+    requires = (SHA2_VERSION == 512) ? (is_arr_init(ctx_msg_ptrs, 0, 8*2) && is_arr_init(ctx_msg_lens, 0, 8*2) &&
+    is_arr_init(sig_slh, 0, SPX_N + FORS_SIG + HT_SIG) && is_arr_init(pk, 0, 2*SPX_N) &&
+    SPX_N + FORS_SIG + HT_SIG <= SPX_SIG && //JogamesHD_ To prevent oob access in sig_slh
+    2*SPX_N <= SPX_PKBYTES && //JogamesHD_ To prevent oob access in pk
+    SPX_MD_LEN + SPX_IDX_TREE_LEN + SPX_IDX_LEAF_LEN <= SPX_M && //_JogamesHD_ To prevent oob access in digest
+
+    ((SPX_LEN_1 * SPX_LG_W + 7) / 8) <= SPX_N && //_JogamesHD_ From __ht_verify call
+    SPX_LEN_1 <= SPX_LEN && (SPX_LEN_1 + SPX_LEN_2) == SPX_LEN && //_JogamesHD_ From __ht_verify call
+    0 <= SPX_ADRS_OFFSET_TYPE && SPX_ADRS_OFFSET_TYPE <= 7 && //_JogamesHD_ From __ht_verify call
+    0 <= SPX_ADRS_OFFSET_KEYPAIRADDR && SPX_ADRS_OFFSET_KEYPAIRADDR <= 7 && //_JogamesHD_ From __ht_verify call
+    0 <= SPX_ADRS_OFFSET_CHAINADDR && SPX_ADRS_OFFSET_CHAINADDR <= 7 && //_JogamesHD_ From __ht_verify call
+    0 <= SPX_ADRS_OFFSET_HASHADDR && SPX_ADRS_OFFSET_HASHADDR <= 7 && //_JogamesHD_ From __ht_verify call
+    SPX_N <= 4*8 && SHA256_OUT == 32 && //_JogamesHD_ From __ht_verify call
+    SHA512_OUT == 64 && //_JogamesHD_ From __ht_verify call
+    SPX_LEN*SPX_N <= WOTS_SIG && //_JogamesHD_ From __ht_verify call
+    0 <= SPX_ADRS_OFFSET_TREEINDEX && SPX_ADRS_OFFSET_TREEINDEX <= 7 && //_JogamesHD_ From __ht_verify call
+    0 <= SPX_ADRS_OFFSET_TREEHEIGHT && SPX_ADRS_OFFSET_TREEHEIGHT <= 7 && //_JogamesHD_ From __ht_verify call
+    WOTS_SIG + SPX_N*SPX_H_PRIME <= XMSS_SIG && //_JogamesHD_ From __ht_verify call
+    0 <= SPX_ADRS_OFFSET_LAYERADDR && SPX_ADRS_OFFSET_LAYERADDR <= 7 && //_JogamesHD_ From __ht_verify call
+    0 <= SPX_ADRS_OFFSET_TREEADDR && SPX_ADRS_OFFSET_TREEADDR <= 5 && //_JogamesHD_ From __ht_verify call
+    SPX_D*XMSS_SIG <= HT_SIG && //_JogamesHD_ From __ht_verify call
+    ((baseb_fors::OUTLEN * baseb_fors::LG_B + 7) / 8) <= baseb_fors::INLEN && //_JogamesHD_ From __fors_pkfromsig call
+    (SPX_A + 1)*SPX_K*SPX_N <= FORS_SIG && //_JogamesHD_ From __fors_pkfromsig call
+    128 <= 3*SPX_N && //_JogamesHD_ From __H_msg call (Replaced PREFIXLEN)
+    SPX_N <= SHA256_IN && SPX_N <= SHA512_IN && //_JogamesHD_ From init_cache call
+    SHA512_IN % 8 == 0 && SHA256_IN % 8 == 0) //_JogamesHD_ From init_cache call
+
+    : (is_arr_init(ctx_msg_ptrs, 0, 8*2) && is_arr_init(ctx_msg_lens, 0, 8*2) &&
+    is_arr_init(sig_slh, 0, SPX_N + FORS_SIG + HT_SIG) && is_arr_init(pk, 0, 2*SPX_N) &&
+    SPX_N + FORS_SIG + HT_SIG <= SPX_SIG && //JogamesHD_ To prevent oob access in sig_slh
+    2*SPX_N <= SPX_PKBYTES && //JogamesHD_ To prevent oob access in pk
+    SPX_MD_LEN + SPX_IDX_TREE_LEN + SPX_IDX_LEAF_LEN <= SPX_M && //_JogamesHD_ To prevent oob access in digest
+
+    ((SPX_LEN_1 * SPX_LG_W + 7) / 8) <= SPX_N && //_JogamesHD_ From __ht_verify call
+    SPX_LEN_1 <= SPX_LEN && (SPX_LEN_1 + SPX_LEN_2) == SPX_LEN && //_JogamesHD_ From __ht_verify call
+    0 <= SPX_ADRS_OFFSET_TYPE && SPX_ADRS_OFFSET_TYPE <= 7 && //_JogamesHD_ From __ht_verify call
+    0 <= SPX_ADRS_OFFSET_KEYPAIRADDR && SPX_ADRS_OFFSET_KEYPAIRADDR <= 7 && //_JogamesHD_ From __ht_verify call
+    0 <= SPX_ADRS_OFFSET_CHAINADDR && SPX_ADRS_OFFSET_CHAINADDR <= 7 && //_JogamesHD_ From __ht_verify call
+    0 <= SPX_ADRS_OFFSET_HASHADDR && SPX_ADRS_OFFSET_HASHADDR <= 7 && //_JogamesHD_ From __ht_verify call
+    SPX_N <= 4*8 && SHA256_OUT == 32 && //_JogamesHD_ From __ht_verify call
+    SPX_LEN*SPX_N <= WOTS_SIG && //_JogamesHD_ From __ht_verify call
+    0 <= SPX_ADRS_OFFSET_TREEINDEX && SPX_ADRS_OFFSET_TREEINDEX <= 7 && //_JogamesHD_ From __ht_verify call
+    0 <= SPX_ADRS_OFFSET_TREEHEIGHT && SPX_ADRS_OFFSET_TREEHEIGHT <= 7 && //_JogamesHD_ From __ht_verify call
+    WOTS_SIG + SPX_N*SPX_H_PRIME <= XMSS_SIG && //_JogamesHD_ From __ht_verify call
+    0 <= SPX_ADRS_OFFSET_LAYERADDR && SPX_ADRS_OFFSET_LAYERADDR <= 7 && //_JogamesHD_ From __ht_verify call
+    0 <= SPX_ADRS_OFFSET_TREEADDR && SPX_ADRS_OFFSET_TREEADDR <= 5 && //_JogamesHD_ From __ht_verify call
+    SPX_D*XMSS_SIG <= HT_SIG && //_JogamesHD_ From __ht_verify call
+    ((baseb_fors::OUTLEN * baseb_fors::LG_B + 7) / 8) <= baseb_fors::INLEN && //_JogamesHD_ From __fors_pkfromsig call
+    (SPX_A + 1)*SPX_K*SPX_N <= FORS_SIG && //_JogamesHD_ From __fors_pkfromsig call
+    64 <= 3*SPX_N && //_JogamesHD_ From __H_msg call (Replaced PREFIXLEN)
+    SPX_N <= SHA256_IN && //_JogamesHD_ From init_cache call
+    SHA256_IN % 8 == 0), //_JogamesHD_ From init_cache call
+
+    ensures = is_arr_init(ctx_msg_ptrs, 0, 8*2) && is_arr_init(ctx_msg_lens, 0, 8*2) &&
+    is_arr_init(sig_slh, 0, SPX_N + FORS_SIG + HT_SIG) && is_arr_init(pk, 0, 2*SPX_N)
+   }
+ ]
+fn slh_verify_internal_(
+    reg ptr u64[2] ctx_msg_ptrs, // context and message pointers
+    reg ptr u64[2] ctx_msg_lens, // context and message lengths
+    reg ptr u8[SPX_SIG] sig_slh, // SPHINCS+ signature
+    reg ptr u8[SPX_PKBYTES] pk   // public key
+) -> reg u64 // -> res
+{
+    // stack variables
+    stack u32[8] adrs;       // ADRS data structure
+    stack u32[3] idx_tree;   // tree index selecting a lowest-layer XMSS tree to sign with
+    stack u8[SPX_N] pk_fors; // FORS public key
+    stack u8[SPX_M] digest;  // full message digest from H_msg
+    stack u8[96] h_cache;    // cached SHA2 state
+
+    // reg variables
+    reg ptr u8[SPX_MD_LEN] md;                 // digest bytes allocated to determine FORS leaf indices
+    reg ptr u8[SPX_IDX_TREE_LEN] tmp_idx_tree; // digest bytes allocated to determine idx_tree
+    reg ptr u8[SPX_IDX_LEAF_LEN] tmp_idx_leaf; // digest bytes allocated to determine idx_leaf
+    reg ptr u8[SPX_N] pkseed pkroot; // pointers to the individual parts of pk
+    reg ptr u8[SPX_N] r;             // message randomiser
+    reg ptr u8[FORS_SIG] sig_fors;   // FORS part of the signature
+    reg u64 ctx_ptr ctx_len;         // pointers to the context string and context length
+    reg u64 msg_ptr msg_len;         // pointers to the message string and message length
+    reg u64 res;                     // indicates whether running this function was successful
+    reg u32 idx_leaf;                // tree index selecting a lowest-layer XMSS tree to sign with
+
+    // initialise ADRS to the all-zero string
+    adrs = __adrs_init(adrs);
+
+    // extract the message and context pointers and lengths from the combined context-message parameters
+    ctx_ptr = ctx_msg_ptrs[0];
+    msg_ptr = ctx_msg_ptrs[1];
+    ctx_len = ctx_msg_lens[0];
+    msg_len = ctx_msg_lens[1];
+
+    // separate PK.seed and PK.root from the overall public key
+    pkseed = pk[0*SPX_N : SPX_N];
+    pkroot = pk[1*SPX_N : SPX_N];
+
+    // extract the message randomiser r from the overall signature
+    r = sig_slh[0 : SPX_N];
+
+    // compute the message digest
+    () = #spill(pkseed, pkroot, sig_slh);
+    digest = __H_msg(digest, r, pkseed, pkroot, ctx_ptr, ctx_len, msg_ptr, msg_len);
+    () = #unspill(pkseed, pkroot, sig_slh);
+
+    // separate the message digest into disjoint bytestrings needed for individual processing
+    md           = digest[0                             : SPX_MD_LEN      ];
+    tmp_idx_tree = digest[SPX_MD_LEN                    : SPX_IDX_TREE_LEN];
+    tmp_idx_leaf = digest[SPX_MD_LEN + SPX_IDX_TREE_LEN : SPX_IDX_LEAF_LEN];
+
+    // turn the tmp_idx_tree and tmp_idx_leaf bytestrings into register values
+    idx_tree, idx_leaf = __indices_to_regs(tmp_idx_tree, tmp_idx_leaf);
+
+    // set the ADRS values for the FORS signature generation
+    adrs = __adrs_set_tree_addr(adrs, idx_tree);     // lowest-layer tree index of the XMSS tree that will sign the FORS public key
+    adrs = __adrs_set_type_and_clear(adrs, SPX_ADRS_TYPE_FORS_TREE);
+    adrs = __adrs_set_key_pair_addr(adrs, idx_leaf); // Leaf index of the XMSS tree that will sign the FORS public key
+
+    // compute the SHA256 state after consuming exactly one block of input,
+    // as that state is the same for all PRF, F, H, T_len, and T_k hash calls,
+    // with any differences only being present in the second block onwards
+    () = #spill(pkroot, sig_slh, idx_leaf);
+    h_cache = init_cache(h_cache, pkseed);
+    () = #unspill(pkroot, sig_slh, idx_leaf);
+
+    // extract the FORS signature from the overall signature
+    sig_fors = sig_slh[SPX_N : FORS_SIG];
+
+    // compute the FORS public key based on the FORS signature
+    () = #spill(pkroot, sig_slh, idx_leaf);
+    pk_fors, adrs = __fors_pkfromsig(pk_fors, sig_fors, md, adrs, h_cache);
+    () = #unspill(pkroot, sig_slh, idx_leaf);
+
+    // verify the hypertree signature on the FORS public key
+    res = __ht_verify(pk_fors, sig_slh[SPX_N + FORS_SIG : HT_SIG], idx_tree, idx_leaf, pkroot, h_cache);
+
+    return res;
+}
+
+//_JogamesHD_ Wrapper, should be the same as wrapped function
+#[safety =
+   {
+    requires = (SHA2_VERSION == 512) ? (is_arr_init(ctx_msg_ptrs, 0, 8*2) && is_arr_init(ctx_msg_lens, 0, 8*2) &&
+    is_arr_init(sig_slh, 0, SPX_N + FORS_SIG + HT_SIG) && is_arr_init(pk, 0, 2*SPX_N) &&
+    SPX_N + FORS_SIG + HT_SIG <= SPX_SIG && //JogamesHD_ To prevent oob access in sig_slh
+    2*SPX_N <= SPX_PKBYTES && //JogamesHD_ To prevent oob access in pk
+    SPX_MD_LEN + SPX_IDX_TREE_LEN + SPX_IDX_LEAF_LEN <= SPX_M && //_JogamesHD_ To prevent oob access in digest
+
+    ((SPX_LEN_1 * SPX_LG_W + 7) / 8) <= SPX_N && //_JogamesHD_ From __ht_verify call
+    SPX_LEN_1 <= SPX_LEN && (SPX_LEN_1 + SPX_LEN_2) == SPX_LEN && //_JogamesHD_ From __ht_verify call
+    0 <= SPX_ADRS_OFFSET_TYPE && SPX_ADRS_OFFSET_TYPE <= 7 && //_JogamesHD_ From __ht_verify call
+    0 <= SPX_ADRS_OFFSET_KEYPAIRADDR && SPX_ADRS_OFFSET_KEYPAIRADDR <= 7 && //_JogamesHD_ From __ht_verify call
+    0 <= SPX_ADRS_OFFSET_CHAINADDR && SPX_ADRS_OFFSET_CHAINADDR <= 7 && //_JogamesHD_ From __ht_verify call
+    0 <= SPX_ADRS_OFFSET_HASHADDR && SPX_ADRS_OFFSET_HASHADDR <= 7 && //_JogamesHD_ From __ht_verify call
+    SPX_N <= 4*8 && SHA256_OUT == 32 && //_JogamesHD_ From __ht_verify call
+    SHA512_OUT == 64 && //_JogamesHD_ From __ht_verify call
+    SPX_LEN*SPX_N <= WOTS_SIG && //_JogamesHD_ From __ht_verify call
+    0 <= SPX_ADRS_OFFSET_TREEINDEX && SPX_ADRS_OFFSET_TREEINDEX <= 7 && //_JogamesHD_ From __ht_verify call
+    0 <= SPX_ADRS_OFFSET_TREEHEIGHT && SPX_ADRS_OFFSET_TREEHEIGHT <= 7 && //_JogamesHD_ From __ht_verify call
+    WOTS_SIG + SPX_N*SPX_H_PRIME <= XMSS_SIG && //_JogamesHD_ From __ht_verify call
+    0 <= SPX_ADRS_OFFSET_LAYERADDR && SPX_ADRS_OFFSET_LAYERADDR <= 7 && //_JogamesHD_ From __ht_verify call
+    0 <= SPX_ADRS_OFFSET_TREEADDR && SPX_ADRS_OFFSET_TREEADDR <= 5 && //_JogamesHD_ From __ht_verify call
+    SPX_D*XMSS_SIG <= HT_SIG && //_JogamesHD_ From __ht_verify call
+    ((baseb_fors::OUTLEN * baseb_fors::LG_B + 7) / 8) <= baseb_fors::INLEN && //_JogamesHD_ From __fors_pkfromsig call
+    (SPX_A + 1)*SPX_K*SPX_N <= FORS_SIG && //_JogamesHD_ From __fors_pkfromsig call
+    128 <= 3*SPX_N && //_JogamesHD_ From __H_msg call (Replaced PREFIXLEN)
+    SPX_N <= SHA256_IN && SPX_N <= SHA512_IN && //_JogamesHD_ From init_cache call
+    SHA512_IN % 8 == 0 && SHA256_IN % 8 == 0) //_JogamesHD_ From init_cache call
+
+    : (is_arr_init(ctx_msg_ptrs, 0, 8*2) && is_arr_init(ctx_msg_lens, 0, 8*2) &&
+    is_arr_init(sig_slh, 0, SPX_N + FORS_SIG + HT_SIG) && is_arr_init(pk, 0, 2*SPX_N) &&
+    SPX_N + FORS_SIG + HT_SIG <= SPX_SIG && //JogamesHD_ To prevent oob access in sig_slh
+    2*SPX_N <= SPX_PKBYTES && //JogamesHD_ To prevent oob access in pk
+    SPX_MD_LEN + SPX_IDX_TREE_LEN + SPX_IDX_LEAF_LEN <= SPX_M && //_JogamesHD_ To prevent oob access in digest
+
+    ((SPX_LEN_1 * SPX_LG_W + 7) / 8) <= SPX_N && //_JogamesHD_ From __ht_verify call
+    SPX_LEN_1 <= SPX_LEN && (SPX_LEN_1 + SPX_LEN_2) == SPX_LEN && //_JogamesHD_ From __ht_verify call
+    0 <= SPX_ADRS_OFFSET_TYPE && SPX_ADRS_OFFSET_TYPE <= 7 && //_JogamesHD_ From __ht_verify call
+    0 <= SPX_ADRS_OFFSET_KEYPAIRADDR && SPX_ADRS_OFFSET_KEYPAIRADDR <= 7 && //_JogamesHD_ From __ht_verify call
+    0 <= SPX_ADRS_OFFSET_CHAINADDR && SPX_ADRS_OFFSET_CHAINADDR <= 7 && //_JogamesHD_ From __ht_verify call
+    0 <= SPX_ADRS_OFFSET_HASHADDR && SPX_ADRS_OFFSET_HASHADDR <= 7 && //_JogamesHD_ From __ht_verify call
+    SPX_N <= 4*8 && SHA256_OUT == 32 && //_JogamesHD_ From __ht_verify call
+    SPX_LEN*SPX_N <= WOTS_SIG && //_JogamesHD_ From __ht_verify call
+    0 <= SPX_ADRS_OFFSET_TREEINDEX && SPX_ADRS_OFFSET_TREEINDEX <= 7 && //_JogamesHD_ From __ht_verify call
+    0 <= SPX_ADRS_OFFSET_TREEHEIGHT && SPX_ADRS_OFFSET_TREEHEIGHT <= 7 && //_JogamesHD_ From __ht_verify call
+    WOTS_SIG + SPX_N*SPX_H_PRIME <= XMSS_SIG && //_JogamesHD_ From __ht_verify call
+    0 <= SPX_ADRS_OFFSET_LAYERADDR && SPX_ADRS_OFFSET_LAYERADDR <= 7 && //_JogamesHD_ From __ht_verify call
+    0 <= SPX_ADRS_OFFSET_TREEADDR && SPX_ADRS_OFFSET_TREEADDR <= 5 && //_JogamesHD_ From __ht_verify call
+    SPX_D*XMSS_SIG <= HT_SIG && //_JogamesHD_ From __ht_verify call
+    ((baseb_fors::OUTLEN * baseb_fors::LG_B + 7) / 8) <= baseb_fors::INLEN && //_JogamesHD_ From __fors_pkfromsig call
+    (SPX_A + 1)*SPX_K*SPX_N <= FORS_SIG && //_JogamesHD_ From __fors_pkfromsig call
+    64 <= 3*SPX_N && //_JogamesHD_ From __H_msg call (Replaced PREFIXLEN)
+    SPX_N <= SHA256_IN && //_JogamesHD_ From init_cache call
+    SHA256_IN % 8 == 0), //_JogamesHD_ From init_cache call
+
+    ensures = is_arr_init(ctx_msg_ptrs, 0, 8*2) && is_arr_init(ctx_msg_lens, 0, 8*2) &&
+    is_arr_init(sig_slh, 0, SPX_N + FORS_SIG + HT_SIG) && is_arr_init(pk, 0, 2*SPX_N)
+   }
+ ]
+inline // inline wrapper that splits parameter live-ranges, to aid the Jasmin compiler
+fn __slh_verify_internal(
+    reg ptr u64[2] ctx_msg_ptrs, // context and message pointers
+    reg ptr u64[2] ctx_msg_lens, // context and message lengths
+    reg ptr u8[SPX_SIG] sig_slh, // SPHINCS+ signature
+    reg ptr u8[SPX_PKBYTES] pk   // public key
+) -> reg u64 // -> res
+{
+    // split live-range of the input parameters into two segments
+    ctx_msg_ptrs = ctx_msg_ptrs; ctx_msg_lens = ctx_msg_lens; sig_slh = sig_slh; pk = pk;
+
+    reg u64 res;
+    res = slh_verify_internal_(ctx_msg_ptrs, ctx_msg_lens, sig_slh, pk);
+
+    // split live-range of the output parameters into two segments
+    res = res;
+
+    return res;
+}
+
+//_JogamesHD_ Same as __slh_verify_internal
+#[safety =
+   {
+    requires = (SHA2_VERSION == 512) ? (is_arr_init(ctx_msg_ptrs, 0, 8*2) && is_arr_init(ctx_msg_lens, 0, 8*2) &&
+    is_arr_init(sig_slh, 0, SPX_N + FORS_SIG + HT_SIG) && is_arr_init(pk, 0, 2*SPX_N) &&
+    SPX_N + FORS_SIG + HT_SIG <= SPX_SIG && //JogamesHD_ To prevent oob access in sig_slh
+    2*SPX_N <= SPX_PKBYTES && //JogamesHD_ To prevent oob access in pk
+    SPX_MD_LEN + SPX_IDX_TREE_LEN + SPX_IDX_LEAF_LEN <= SPX_M && //_JogamesHD_ To prevent oob access in digest
+
+    ((SPX_LEN_1 * SPX_LG_W + 7) / 8) <= SPX_N && //_JogamesHD_ From __ht_verify call
+    SPX_LEN_1 <= SPX_LEN && (SPX_LEN_1 + SPX_LEN_2) == SPX_LEN && //_JogamesHD_ From __ht_verify call
+    0 <= SPX_ADRS_OFFSET_TYPE && SPX_ADRS_OFFSET_TYPE <= 7 && //_JogamesHD_ From __ht_verify call
+    0 <= SPX_ADRS_OFFSET_KEYPAIRADDR && SPX_ADRS_OFFSET_KEYPAIRADDR <= 7 && //_JogamesHD_ From __ht_verify call
+    0 <= SPX_ADRS_OFFSET_CHAINADDR && SPX_ADRS_OFFSET_CHAINADDR <= 7 && //_JogamesHD_ From __ht_verify call
+    0 <= SPX_ADRS_OFFSET_HASHADDR && SPX_ADRS_OFFSET_HASHADDR <= 7 && //_JogamesHD_ From __ht_verify call
+    SPX_N <= 4*8 && SHA256_OUT == 32 && //_JogamesHD_ From __ht_verify call
+    SHA512_OUT == 64 && //_JogamesHD_ From __ht_verify call
+    SPX_LEN*SPX_N <= WOTS_SIG && //_JogamesHD_ From __ht_verify call
+    0 <= SPX_ADRS_OFFSET_TREEINDEX && SPX_ADRS_OFFSET_TREEINDEX <= 7 && //_JogamesHD_ From __ht_verify call
+    0 <= SPX_ADRS_OFFSET_TREEHEIGHT && SPX_ADRS_OFFSET_TREEHEIGHT <= 7 && //_JogamesHD_ From __ht_verify call
+    WOTS_SIG + SPX_N*SPX_H_PRIME <= XMSS_SIG && //_JogamesHD_ From __ht_verify call
+    0 <= SPX_ADRS_OFFSET_LAYERADDR && SPX_ADRS_OFFSET_LAYERADDR <= 7 && //_JogamesHD_ From __ht_verify call
+    0 <= SPX_ADRS_OFFSET_TREEADDR && SPX_ADRS_OFFSET_TREEADDR <= 5 && //_JogamesHD_ From __ht_verify call
+    SPX_D*XMSS_SIG <= HT_SIG && //_JogamesHD_ From __ht_verify call
+    ((baseb_fors::OUTLEN * baseb_fors::LG_B + 7) / 8) <= baseb_fors::INLEN && //_JogamesHD_ From __fors_pkfromsig call
+    (SPX_A + 1)*SPX_K*SPX_N <= FORS_SIG && //_JogamesHD_ From __fors_pkfromsig call
+    128 <= 3*SPX_N && //_JogamesHD_ From __H_msg call (Replaced PREFIXLEN)
+    SPX_N <= SHA256_IN && SPX_N <= SHA512_IN && //_JogamesHD_ From init_cache call
+    SHA512_IN % 8 == 0 && SHA256_IN % 8 == 0) //_JogamesHD_ From init_cache call
+
+    : (is_arr_init(ctx_msg_ptrs, 0, 8*2) && is_arr_init(ctx_msg_lens, 0, 8*2) &&
+    is_arr_init(sig_slh, 0, SPX_N + FORS_SIG + HT_SIG) && is_arr_init(pk, 0, 2*SPX_N) &&
+    SPX_N + FORS_SIG + HT_SIG <= SPX_SIG && //JogamesHD_ To prevent oob access in sig_slh
+    2*SPX_N <= SPX_PKBYTES && //JogamesHD_ To prevent oob access in pk
+    SPX_MD_LEN + SPX_IDX_TREE_LEN + SPX_IDX_LEAF_LEN <= SPX_M && //_JogamesHD_ To prevent oob access in digest
+
+    ((SPX_LEN_1 * SPX_LG_W + 7) / 8) <= SPX_N && //_JogamesHD_ From __ht_verify call
+    SPX_LEN_1 <= SPX_LEN && (SPX_LEN_1 + SPX_LEN_2) == SPX_LEN && //_JogamesHD_ From __ht_verify call
+    0 <= SPX_ADRS_OFFSET_TYPE && SPX_ADRS_OFFSET_TYPE <= 7 && //_JogamesHD_ From __ht_verify call
+    0 <= SPX_ADRS_OFFSET_KEYPAIRADDR && SPX_ADRS_OFFSET_KEYPAIRADDR <= 7 && //_JogamesHD_ From __ht_verify call
+    0 <= SPX_ADRS_OFFSET_CHAINADDR && SPX_ADRS_OFFSET_CHAINADDR <= 7 && //_JogamesHD_ From __ht_verify call
+    0 <= SPX_ADRS_OFFSET_HASHADDR && SPX_ADRS_OFFSET_HASHADDR <= 7 && //_JogamesHD_ From __ht_verify call
+    SPX_N <= 4*8 && SHA256_OUT == 32 && //_JogamesHD_ From __ht_verify call
+    SPX_LEN*SPX_N <= WOTS_SIG && //_JogamesHD_ From __ht_verify call
+    0 <= SPX_ADRS_OFFSET_TREEINDEX && SPX_ADRS_OFFSET_TREEINDEX <= 7 && //_JogamesHD_ From __ht_verify call
+    0 <= SPX_ADRS_OFFSET_TREEHEIGHT && SPX_ADRS_OFFSET_TREEHEIGHT <= 7 && //_JogamesHD_ From __ht_verify call
+    WOTS_SIG + SPX_N*SPX_H_PRIME <= XMSS_SIG && //_JogamesHD_ From __ht_verify call
+    0 <= SPX_ADRS_OFFSET_LAYERADDR && SPX_ADRS_OFFSET_LAYERADDR <= 7 && //_JogamesHD_ From __ht_verify call
+    0 <= SPX_ADRS_OFFSET_TREEADDR && SPX_ADRS_OFFSET_TREEADDR <= 5 && //_JogamesHD_ From __ht_verify call
+    SPX_D*XMSS_SIG <= HT_SIG && //_JogamesHD_ From __ht_verify call
+    ((baseb_fors::OUTLEN * baseb_fors::LG_B + 7) / 8) <= baseb_fors::INLEN && //_JogamesHD_ From __fors_pkfromsig call
+    (SPX_A + 1)*SPX_K*SPX_N <= FORS_SIG && //_JogamesHD_ From __fors_pkfromsig call
+    64 <= 3*SPX_N && //_JogamesHD_ From __H_msg call (Replaced PREFIXLEN)
+    SPX_N <= SHA256_IN && //_JogamesHD_ From init_cache call
+    SHA256_IN % 8 == 0), //_JogamesHD_ From init_cache call
+
+    ensures = is_arr_init(ctx_msg_ptrs, 0, 8*2) && is_arr_init(ctx_msg_lens, 0, 8*2) &&
+    is_arr_init(sig_slh, 0, SPX_N + FORS_SIG + HT_SIG) && is_arr_init(pk, 0, 2*SPX_N)
+   }
+ ]
+export // this function is visible to the outside after compilation
+// it's the same as __slh_verify_internal, but separated to prevent
+// the warning 'warning: export function will be inlined'
+fn slh_verify_internal_avx2(
+    reg ptr u64[2] ctx_msg_ptrs, // context and message pointers
+    reg ptr u64[2] ctx_msg_lens, // context and message lengths
+    reg ptr u8[SPX_SIG] sig_slh, // SPHINCS+ signature
+    reg ptr u8[SPX_PKBYTES] pk   // public key
+) -> reg u64 // -> res
+{
+    // split live-range of the input parameters into two segments
+    ctx_msg_ptrs = ctx_msg_ptrs; ctx_msg_lens = ctx_msg_lens; sig_slh = sig_slh; pk = pk;
+
+    reg u64 res;
+    res = slh_verify_internal_(ctx_msg_ptrs, ctx_msg_lens, sig_slh, pk);
+
+    // split live-range of the output parameters into two segments
+    res = res;
+
+    return res;
+}

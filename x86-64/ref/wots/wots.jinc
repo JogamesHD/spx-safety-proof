@@ -1,0 +1,479 @@
+// namespace for the base_w computation of the WOTS+ message parts
+namespace baseb_wots_m {
+  param int B      = SPX_W;
+  param int LG_B   = SPX_LG_W;
+  param int OUTLEN = SPX_LEN_1;
+  param int INLEN  = SPX_N;
+  require "../misc/baseb.jinc" // algorithm 4 of SLH-DSS: base_2^b
+}
+
+// namespace for the base_w computation of the WOTS+ checksum parts
+namespace baseb_wots_c {
+  param int B      = SPX_W;
+  param int LG_B   = SPX_LG_W;
+  param int OUTLEN = SPX_LEN_2;
+  param int INLEN  = (SPX_LEN_2 * SPX_LG_W + 7) / 8;
+  require "../misc/baseb.jinc" // algorithm 4 of SLH-DSS: base_2^b
+}
+
+/////////////////////// HELPER FUNCTIONS ///////////////////////
+
+// checksum computation over the message parts
+inline
+fn __csum(
+    reg ptr u32[SPX_LEN_1] msg // message input
+) -> reg u32 // -> csum
+{
+    // register variables
+    reg u32 csum; // checksum value
+
+    inline int i;
+
+    // resolve at compile time: sum_(i=0)^(len_1) w-1 = len_1 * (w-1)
+    csum = SPX_LEN_1 * (SPX_W-1);
+
+    // subtract the message parts to get sum_(i=0)^(len_1) w-1-msg[i]
+    for i=0 to SPX_LEN_1 { csum -= msg[i]; }
+
+    // the checksum is later converted into base-w digits by interpreting
+    // its byte encoding from the most-significant bits first
+    //
+    // each base-w digit uses log(w) bits, so the total checksum bitlength is len_2*log(w)
+    //
+    // if this bitlength is not a multiple of 8, the checksum bits are not
+    // correctly aligned to the start of the byte array
+    //
+    // there are len_2*log(w) mod 8 bits that are not correctly left-aligned
+    // so we need to left-shift the csum value by (8-(len_2*log(w) mod 8)) mod 8 bits
+    csum <<= ((8-((SPX_LEN_2*SPX_LG_W) % 8)) % 8); // all resolved at compile time
+
+    return csum;
+}
+
+// compute for each chain how often its secret key value is
+// iteratively hashed to obtain the WOTS+ signature values
+inline
+fn __chain_lengths(
+    reg ptr u32[SPX_LEN] lengths, // out: chain lengths as integers
+    reg ptr u8[SPX_N] msg         // message input
+) -> reg ptr u32[SPX_LEN] // -> lengths
+{
+    // stack variables
+    stack u8[(SPX_LEN_2 * SPX_LG_W + 7) / 8] csum_basew; // buffer for the checksum value as base-w bytes
+
+    // register variables
+    reg u32 csum;      // checksum value
+    reg u32 csum_byte; // temporary variable for bitshifting and masking purposes
+
+    inline int k;
+
+    // compute the base-w message part indices
+    lengths[0 : SPX_LEN_1] = baseb_wots_m::__base_b(lengths[0 : SPX_LEN_1], msg);
+
+    // compute the checksum value
+    csum = __csum(lengths[0 : SPX_LEN_1]);
+
+    // convert the csum value into bytes, setting the least-significant bytes first
+    for k=0 to (SPX_LEN_2 * SPX_LG_W + 7) / 8 {
+        csum_byte = csum;  // copy the csum value
+        csum_byte >>= k*8; // bitshift the next byte to the least-significant byte position
+        csum_byte &= 0xFF; // compute mod 256
+        csum_basew[((SPX_LEN_2 * SPX_LG_W + 7) / 8 - 1) - k] = (8u) csum_byte;
+    }
+
+    // compute the base-w checksum part indices, and append to the message part indices
+    lengths[SPX_LEN_1 : SPX_LEN_2] = baseb_wots_c::__base_b(lengths[SPX_LEN_1 : SPX_LEN_2], csum_basew);
+
+    return lengths;
+}
+
+//////////////////////// MAIN FUNCTIONS ////////////////////////
+
+/*-------------------------------------------------------------+
+| ALGORITHM 5 FROM SLH-DSS (FIPS 205)                          |
+| Chaining function used in WOTS+.                             |
++-------------------------------------------------------------*/
+fn chain(
+    reg ptr u8[SPX_N] out,    // out: hash of previous chain value (also input: chain is in-place)
+    reg u32 i,                // position in the chain
+    reg u32 steps,            // number of hash evaluations to do
+    reg ptr u8[SPX_N] pkseed, // PK.seed
+    reg ptr u32[8] adrs       // ADRS
+) -> reg ptr u8[SPX_N], reg ptr u32[8] // -> out, adrs
+{
+    // register variables
+    reg u32 t; // hash iteration target
+
+    // target = i + steps
+    t = i;
+    t += steps;
+
+    // iterate over the hash evaluations
+    while (i < t) {
+        // update the hash iteration in ADRS
+        adrs = __adrs_set_hash_addr(adrs, i);
+
+        () = #spill(pkseed, adrs, i, t); // free up space in the registers
+
+        // compute (in-place) the hash of the previous chain value
+        out = __F(out, pkseed, adrs);
+
+        () = #unspill(pkseed, adrs, i, t);
+
+        // advance to the next iteration
+        i += 1;
+    }
+
+    return out, adrs;
+}
+
+inline // inline wrapper that splits parameter live-ranges, to aid the Jasmin compiler
+fn __chain(
+    reg ptr u8[SPX_N] out,    // out: hash of previous chain value (also input: chain is in-place)
+    reg u32 i,                // position in the chain
+    reg u32 steps,            // number of hash evaluations to do
+    reg ptr u8[SPX_N] pkseed, // PK.seed
+    reg ptr u32[8] adrs       // ADRS
+) -> reg ptr u8[SPX_N], reg ptr u32[8] // -> out, adrs
+{
+    // split live-range of the parameters into two segments
+    out = out; i = i; steps = steps; pkseed = pkseed; adrs = adrs;
+
+    out, adrs = chain(out, i, steps, pkseed, adrs);
+
+    // split live-range of the output parameters into two segments
+    out = out; adrs = adrs;
+
+    return out, adrs;
+}
+
+/*-------------------------------------------------------------+
+| ALGORITHM 6 FROM SLH-DSS (FIPS 205)                          |
+| Generates a WOTS+ public key.                                |
++-------------------------------------------------------------*/
+fn wots_pkgen(
+    reg ptr u8[SPX_N] pk,     // out: WOTS+ public key
+    reg ptr u8[SPX_N] skseed, // SK.seed
+    reg ptr u8[SPX_N] pkseed, // PK.seed
+    reg ptr u32[8] adrs       // ADRS
+) -> reg ptr u8[SPX_N], reg ptr u32[8] // -> pk, adrs
+{
+    () = #spill(pk); // not needed until the end of the function
+
+    // stack variables
+    stack u32[8] adrs_key;     // ADRS clone for computing the WOTS+ secret and public key values
+    stack u8[WOTS_SIG] chains; // all chain values concatenated
+
+    // register variables
+    reg u32 kpa;        // ADRS key pair address
+    reg u32 cha;        // ADRS chain address
+    reg u32 start;      // chain start index
+    reg u32 steps;      // number of hash evaluations
+    reg u32 idx_chain;  // index of the chain
+    reg u64 chain_addr; // byte address of the chain in 'chains'
+
+    // clone ADRS (adrs_key here is what the SLH-DSS calls skADRS),
+    // and set the correct type for computing WOTS+ secret keys
+    adrs_key = __adrs_clone(adrs_key, adrs);
+    adrs_key = __adrs_set_type_and_clear(adrs_key, SPX_ADRS_TYPE_WOTS_PRF);
+
+    // get the key pair address from ADRS, and set it in adrs_key
+    kpa = __adrs_get_key_pair_addr(adrs);
+    adrs_key = __adrs_set_key_pair_addr(adrs_key, kpa);
+
+    () = #spill(kpa);  // not needed until after the while loops
+    () = #spill(adrs); // not needed until the second while loop
+
+    // compute all secret key values
+    chain_addr = 0; // start at the first chain
+    idx_chain = 0;  // iterate over the chains
+    while (idx_chain < SPX_LEN) {
+        () = #spill(skseed, pkseed, idx_chain, chain_addr); // free up space in the registers
+
+        // update the chain address in ADRS
+        cha = idx_chain;
+        adrs_key = __adrs_set_chain_addr(adrs_key, cha);
+
+        // compute the WOTS+ secret key value
+        chains[chain_addr : SPX_N] = __PRF(chains[chain_addr : SPX_N], pkseed, skseed, adrs_key);
+
+        () = #unspill(skseed, pkseed, idx_chain, chain_addr);
+
+        idx_chain  += 1;     // advance to the next chain
+        chain_addr += SPX_N; // one n-byte chain value has been written
+    }
+
+    () = #unspill(adrs);
+
+    // compute all public key values
+    chain_addr = 0; // start at the first chain
+    idx_chain = 0;  // iterate over the chains
+    while (idx_chain < SPX_LEN) {
+        () = #spill(pkseed, idx_chain, chain_addr); // free up space in the registers
+
+        // update the chain address in ADRS
+        cha = idx_chain;
+        adrs = __adrs_set_chain_addr(adrs, cha);
+
+        start = 0;       // start index is the first chain value (the secret key value)
+        steps = SPX_W-1; // evaluate the entire hash chain to the last chain value (the public key value)
+
+        // compute the WOTS+ public key value
+        chains[chain_addr : SPX_N], adrs = __chain(chains[chain_addr : SPX_N], start, steps, pkseed, adrs);
+
+        () = #unspill(pkseed, idx_chain, chain_addr);
+
+        idx_chain  += 1;     // advance to the next chain
+        chain_addr += SPX_N; // one n-byte chain value has been written
+    }
+
+    // adrs_key now becomes wotspkADRS (to avoid an ADRS clone)
+    adrs_key = __adrs_set_type_and_clear(adrs_key, SPX_ADRS_TYPE_WOTS_PK);
+
+    // kpa value hasn't changed since before the chain computations
+    () = #unspill(kpa);
+    adrs_key = __adrs_set_key_pair_addr(adrs_key, kpa);
+
+    () = #unspill(pk);
+
+    // compute the WOTS+ overall public key by hashing all public key chain values together
+    () = #spill(adrs);
+    pk = __T_len(pk, pkseed, adrs_key, chains);
+    () = #unspill(adrs);
+
+    return pk, adrs;
+}
+
+inline // inline wrapper that splits parameter live-ranges, to aid the Jasmin compiler
+fn __wots_pkgen(
+    reg ptr u8[SPX_N] pk,     // out: WOTS+ public key
+    reg ptr u8[SPX_N] skseed, // SK.seed
+    reg ptr u8[SPX_N] pkseed, // PK.seed
+    reg ptr u32[8] adrs       // ADRS
+) -> reg ptr u8[SPX_N], reg ptr u32[8] // -> pk, adrs
+{
+    // split live-range of the parameters into two segments
+    pk = pk; skseed = skseed; pkseed = pkseed; adrs = adrs;
+
+    pk, adrs = wots_pkgen(pk, skseed, pkseed, adrs);
+
+    // split live-range of the output parameters into two segments
+    pk = pk; adrs = adrs;
+
+    return pk, adrs;
+}
+
+/*-------------------------------------------------------------+
+| ALGORITHM 7 FROM SLH-DSS (FIPS 205)                          |
+| Generates a WOTS+ signature on an n-byte message.            |
++-------------------------------------------------------------*/
+fn wots_sign(
+    reg ptr u8[WOTS_SIG] sig_wots, // out: WOTS+ signature
+    reg ptr u8[SPX_N] m,           // message to sign (XMSS tree root or FORS public key)
+    reg ptr u8[SPX_N] skseed,      // SK.seed
+    reg ptr u8[SPX_N] pkseed,      // PK.seed
+    reg ptr u32[8] adrs            // ADRS
+) -> reg ptr u8[WOTS_SIG], reg ptr u32[8] // -> sig_wots, adrs
+{
+    // stack variables
+    stack u32[SPX_LEN] lengths; // indices indicating number of hash evaluations per chain
+    stack u32[8] skadrs;        // ADRS clone for computing WOTS+ secret key
+
+    // register variables
+    reg ptr u8[SPX_N] sk_wots; // pointer to one WOTS+ secret key
+    reg ptr u8[SPX_N] pk_wots; // pointer to one WOTS+ public key
+    reg u32 kpa;          // ADRS key pair address
+    reg u32 cha;          // ADRS chain address
+    reg u32 start;        // chain start index
+    reg u32 steps;        // number of hash evaluations
+    reg u32 idx_chain;    // index of the chain
+    reg u64 idx_chain_64; // temporary variable to convert between u32 and u64
+    reg u64 chain_addr;   // byte address of the chain in 'chains'
+
+    // compute the chain lengths based on the message
+    lengths = __chain_lengths(lengths, m);
+
+    // clone ADRS and set the correct type for computing WOTS+ secret keys
+    skadrs = __adrs_clone(skadrs, adrs);
+    skadrs = __adrs_set_type_and_clear(skadrs, SPX_ADRS_TYPE_WOTS_PRF);
+
+    // get the key pair address from ADRS, and set it in skADRS
+    kpa = __adrs_get_key_pair_addr(adrs);
+    skadrs = __adrs_set_key_pair_addr(skadrs, kpa);
+
+    () = #spill(adrs);
+
+    // compute all secret key values
+    chain_addr = 0; // start at the first chain
+    idx_chain = 0;  // iterate over the chains
+    while (idx_chain < SPX_LEN) {
+        () = #spill(skseed, pkseed, idx_chain, chain_addr); // free up space in the registers
+
+        // update the chain address in ADRS
+        cha = idx_chain;
+        skadrs = __adrs_set_chain_addr(skadrs, cha);
+
+        // compute the WOTS+ secret key value
+        sk_wots = sig_wots[chain_addr : SPX_N]; // get the pointer to the subarray so the full array can be spilled
+        () = #spill(sig_wots);
+        sk_wots = __PRF(sk_wots, pkseed, skseed, skadrs);
+        () = #unspill(sig_wots);
+        sig_wots[chain_addr : SPX_N] = sk_wots; // redesignate the pointer so the region of the full array is not partial
+
+        () = #unspill(skseed, pkseed, idx_chain, chain_addr);
+
+        idx_chain  += 1;     // advance to the next chain
+        chain_addr += SPX_N; // one n-byte chain value has been written
+    }
+
+    () = #unspill(adrs);
+
+    // compute all signature values
+    chain_addr = 0; // start at the first chain
+    idx_chain = 0;  // iterate over the chains
+    while (idx_chain < SPX_LEN) {
+        () = #spill(pkseed, idx_chain, chain_addr); // free up space in the registers
+
+        // update the chain address in ADRS
+        cha = idx_chain;
+        adrs = __adrs_set_chain_addr(adrs, cha);
+
+        start = 0;                      // start index is the first chain value (the secret key value)
+        idx_chain_64 = (64u) idx_chain; // convert between u32 and u64
+        steps = lengths[idx_chain_64];  // evaluate the hash chain to the signature value
+
+        // compute the WOTS+ signature value
+        pk_wots = sig_wots[chain_addr : SPX_N]; // get the pointer to the subarray so the full array can be spilled
+        () = #spill(sig_wots);
+        pk_wots, adrs = __chain(pk_wots, start, steps, pkseed, adrs);
+        () = #unspill(sig_wots);
+        sig_wots[chain_addr : SPX_N] = pk_wots; // redesignate the pointer so the region of the full array is not partial
+
+        () = #unspill(pkseed, idx_chain, chain_addr);
+
+        idx_chain  += 1;     // advance to the next chain
+        chain_addr += SPX_N; // one n-byte chain value has been written
+    }
+
+    return sig_wots, adrs;
+}
+
+inline // inline wrapper that splits parameter live-ranges, to aid the Jasmin compiler
+fn __wots_sign(
+    reg ptr u8[WOTS_SIG] sig_wots, // out: WOTS+ signature
+    reg ptr u8[SPX_N] m,           // message to sign (XMSS tree root or FORS public key)
+    reg ptr u8[SPX_N] skseed,      // SK.seed
+    reg ptr u8[SPX_N] pkseed,      // PK.seed
+    reg ptr u32[8] adrs            // ADRS
+) -> reg ptr u8[WOTS_SIG], reg ptr u32[8] // -> sig_wots, adrs
+{
+    // split live-range of the parameters into two segments
+    sig_wots = sig_wots; m = m; skseed = skseed; pkseed = pkseed; adrs = adrs;
+
+    sig_wots, adrs = wots_sign(sig_wots, m, skseed, pkseed, adrs);
+
+    // split live-range of the output parameters into two segments
+    sig_wots = sig_wots; adrs = adrs;
+
+    return sig_wots, adrs;
+}
+
+/*-------------------------------------------------------------+
+| ALGORITHM 8 FROM SLH-DSS (FIPS 205)                          |
+| Computes a WOTS+ public key from a message and its           |
+| signature.                                                   |
++-------------------------------------------------------------*/
+fn wots_pkfromsig(
+    reg ptr u8[SPX_N] pk_wots,     // out: WOTS+ public key
+    reg ptr u8[WOTS_SIG] sig_wots, // WOTS+ signature
+    reg ptr u8[SPX_N] m,           // message (XMSS root or FORS public key)
+    reg ptr u8[SPX_N] pkseed,      // PK.seed
+    reg ptr u32[8] adrs            // ADRS
+) -> reg ptr u8[SPX_N], reg ptr u32[8] // -> pk_wots, adrs
+{
+    () = #spill(pk_wots); // only needed at the end of this function
+
+    // stack variables
+    stack u32[SPX_LEN] lengths; // indices indicating number of hash evaluations per chain
+    stack u8[WOTS_SIG] sigvals; // all chain values concatenated
+    stack u32[8] wotspkADRS;    // ADRS clone for computing the WOTS+ public key values
+
+    // register variables
+    reg u32 kpa;          // ADRS key pair address
+    reg u32 cha;          // ADRS chain address
+    reg u32 start;        // chain start index
+    reg u32 steps;        // number of hash evaluations
+    reg u32 idx_chain;    // index of the chain
+    reg u64 idx_chain_64; // temporary variable to convert between u32 and u64
+    reg u64 chain_addr;   // byte address of the chain in 'chains'
+
+    inline int j;
+
+    // compute the chain lengths based on the message
+    lengths = __chain_lengths(lengths, m);
+
+    // copy the WOTS+ signature into sigvals (as sig_wots is not writable)
+    for j=0 to WOTS_SIG { sigvals[j] = sig_wots[j]; }
+
+    // compute all public key values
+    chain_addr = 0; // start at the first chain
+    idx_chain = 0;  // iterate over the chains
+    while (idx_chain < SPX_LEN) {
+        () = #spill(pkseed, idx_chain, chain_addr);
+
+        // update the chain address in ADRS
+        cha = idx_chain;
+        adrs = __adrs_set_chain_addr(adrs, cha);
+
+        idx_chain_64 = (64u) idx_chain; // convert between u32 and u64
+        start = lengths[idx_chain_64];  // start index is that of the signature value
+        // to hash the chain to completion, we need to get to index SPX_W-1, and we are already at index 'start'
+        steps = SPX_W-1;
+        steps -= start;
+
+        // compute the WOTS+ public key value from the signature value
+        sigvals[chain_addr : SPX_N], adrs = __chain(sigvals[chain_addr : SPX_N], start, steps, pkseed, adrs);
+
+        () = #unspill(pkseed, idx_chain, chain_addr);
+
+        idx_chain  += 1;     // advance to the next chain
+        chain_addr += SPX_N; // one n-byte chain value has been written
+    }
+
+    // set the correct ADRS values for WOTS+ public key generation
+    wotspkADRS = __adrs_clone(wotspkADRS, adrs);
+    wotspkADRS = __adrs_set_type_and_clear(wotspkADRS, SPX_ADRS_TYPE_WOTS_PK);
+
+    // get the key pair address from ADRS, and set it in wotspkADRS
+    kpa = __adrs_get_key_pair_addr(adrs);
+    wotspkADRS = __adrs_set_key_pair_addr(wotspkADRS, kpa);
+
+    () = #unspill(pk_wots);
+
+    // compute the WOTS+ overall public key by hashing all public key chain values together
+    () = #spill(adrs);
+    pk_wots = __T_len(pk_wots, pkseed, wotspkADRS, sigvals);
+    () = #unspill(adrs);
+
+    return pk_wots, adrs;
+}
+
+inline // inline wrapper that splits parameter live-ranges, to aid the Jasmin compiler
+fn __wots_pkfromsig(
+    reg ptr u8[SPX_N] pk_wots,     // out: WOTS+ public key
+    reg ptr u8[WOTS_SIG] sig_wots, // WOTS+ signature
+    reg ptr u8[SPX_N] m,           // message (XMSS root or FORS public key)
+    reg ptr u8[SPX_N] pkseed,      // PK.seed
+    reg ptr u32[8] adrs            // ADRS
+) -> reg ptr u8[SPX_N], reg ptr u32[8] // -> pk_wots, adrs
+{
+    // split live-range of the parameters into two segments
+    pk_wots = pk_wots; sig_wots = sig_wots; m = m; pkseed = pkseed; adrs = adrs;
+
+    pk_wots, adrs = wots_pkfromsig(pk_wots, sig_wots, m, pkseed, adrs);
+
+    // split live-range of the output parameters into two segments
+    pk_wots = pk_wots; adrs = adrs;
+
+    return pk_wots, adrs;
+}

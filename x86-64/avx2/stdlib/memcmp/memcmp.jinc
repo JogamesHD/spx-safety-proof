@@ -1,0 +1,25 @@
+// Returns 0 if a and b are equal
+// Returns -1 otherwise
+//_JogamesHD_ Every byte of a and b is read so it must be fully initialized
+#[safety =
+   {
+    requires = is_arr_init(a, 0, SPX_N) && is_arr_init(b, 0, SPX_N),
+    ensures = is_arr_init(a, 0, SPX_N) && is_arr_init(b, 0, SPX_N)
+   }
+ ]
+inline
+fn __memcmp(reg ptr u8[SPX_N] a b) -> reg u8 {
+    reg u8 t acc;
+
+    inline int i;
+
+    acc = 0;
+  
+    for i=0 to SPX_N {
+        t = a[i];
+        t ^= b[i];
+        acc |= t;
+    }
+
+    return acc;
+}

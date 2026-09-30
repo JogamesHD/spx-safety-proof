@@ -1,0 +1,379 @@
+//_JogamesHD_ Every byte of _H is read, so it must be fully initialized
+//_JogamesHD_ The first 4*16 bytes of W must be initialized because of the precondition of __Wt_ptr_ref
+#[safety =
+   {
+    requires = is_arr_init(_H, 0, 4*8) && is_arr_init(W, 0, 4*16),
+    ensures = is_arr_init(_H, 0, 4*8) && is_arr_init(W, 0, 4*64)
+   }
+ ]
+fn compress(
+  reg ptr u32[8] _H,
+  reg ptr u32[64] W
+) -> reg ptr u32[8], reg ptr u32[64] // -> _H, W // W is only returned because W needs to be writable
+{
+  inline int t;
+  reg u32 T1 T2 a b c d e f g h r;
+  reg ptr u32[64] Kp;
+  stack ptr u32[8] Hp;
+  reg ptr u32[8] H;
+  reg u64 tr;
+  reg u32 swap;
+
+  Kp = SHA256_K;
+  Hp = _H;
+
+  H = Hp;
+
+  // W is written to one byte at a time, but is read from in 32-bit words,
+  // so we need to account for the Endianness
+  
+  for t=0 to 16 {
+    swap = W[t];
+    swap = #BSWAP_32(swap);
+    W[t] = swap;
+  }
+
+  for t=16 to 64 { W = __Wt_ptr_ref(W, t); }
+
+  a, b, c, d, e, f, g, h, H = __load_H_ref(H);
+  Hp = H;
+
+  tr = 0;
+  while(tr < 64) {
+    //T1 = h + BSIG1(e) + CH(e,f,g) + Kt + Wt
+    T1  = h;
+    r   = __BSIG1_ref(e);
+    T1 += r;
+    r   = __CH_ref(e,f,g);
+    T1 += r;
+    T1 += Kp[tr];
+    T1 += W[tr];
+
+    //T2 = BSIG0(a) + MAJ(a,b,c)
+    T2  = __BSIG0_ref(a);
+    r   = __MAJ_ref(a,b,c);
+    T2 += r;
+
+    h  = g; g  = f; f  = e; e  = d;  e += T1;
+    d  = c; c  = b; b  = a; a  = T1; a += T2;
+
+    tr+= 1;
+  }
+
+  H = Hp;
+  a += H[0]; b += H[1]; c += H[2]; d += H[3];
+  e += H[4]; f += H[5]; g += H[6]; h += H[7];
+
+  H = __store_H_ref(H,a,b,c,d,e,f,g,h);
+
+  _H = H;
+  return _H, W;
+}
+
+//_JogamesHD_ Every byte from Hp and prefix is read, so they must be fully initialized
+//_JogamesHD_ W must be partially initialized to guarantee the precondition of compress
+//_JogamesHD_ Bound on idx_W prevents an underflow
+//_JogamesHD_ Bound on in_len + idx_W is necessary, so that compress is executed
+//_JogamesHD_ at least once (to ensure is_arr_init(W, 0, 4*64))
+//_JogamesHD_ _Question_ Will need is_mem_init later
+#[safety =
+   {
+    requires = is_arr_init(Hp, 0, 4*8) && is_arr_init(W, 0, idx_W) &&
+    0 <= idx_W && idx_W <= 64 && 64 <= in_len + idx_W,
+    ensures = is_arr_init(Hp, 0, 4*8) && is_arr_init(W, 0, 4*64) &&
+    0 <= idx_W && idx_W <= 63
+   }
+ ]
+fn absorb_pointer(
+  reg ptr u32[8] Hp,
+  reg ptr u32[64] W,
+  reg u64 idx_W,
+  reg u64 in_ptr,
+  reg u64 in_len
+) -> reg ptr u32[8], reg ptr u32[64], reg u64 // -> Hp, W, idx_W
+{
+  reg u64 avail;
+  reg u64 target;
+
+  avail = 64;
+  avail -= idx_W;
+
+  // if enough message bytes are present, fill the current block and run the compression function once
+  if (in_len >= avail) {
+    // fill the rest of the block
+    while (idx_W < 64) {
+      W[:u8 idx_W] = [:u8 in_ptr];
+      idx_W  += 1;
+      in_ptr += 1;
+    }
+
+    // run the compression function
+    () = #spill(in_ptr, in_len, avail);
+    Hp, W = compress(Hp, W);
+    () = #unspill(in_ptr, in_len, avail);
+
+    idx_W = 0;
+    in_len -= avail; // 'avail' number of bytes consumed
+  }
+
+  // if enough message bytes are present, process full blocks of message bytes
+  while (in_len >= 64) {
+    // fill the rest of the block
+    while (idx_W < 64) {
+      W[:u8 idx_W] = [:u8 in_ptr];
+      idx_W += 1;
+      in_ptr += 1;
+    }
+
+    // run the compression function
+    () = #spill(in_ptr, in_len);
+    Hp, W = compress(Hp, W);
+    () = #unspill(in_ptr, in_len);
+
+    idx_W = 0;
+    in_len -= 64; // 64 bytes consumed
+  }
+
+  // write the remainder of the message bytes to W and update idx_W
+  target = idx_W;
+  target += in_len;
+  while (idx_W < target) {
+    W[:u8 idx_W] = [:u8 in_ptr];
+    idx_W  += 1;
+    in_ptr += 1;
+  }
+
+  return Hp, W, idx_W;
+}
+//_JogamesHD_ Every byte from Hp and prefix is read, so they must be fully initialized
+//_JogamesHD_ W must be partially initialized to guarantee the precondition of compress
+//_JogamesHD_ Bound on idx_W prevents an underflow
+//_JogamesHD_ Bound on PREFIXLEN + idx_W is necessary, so that compress is executed
+//_JogamesHD_ at least once (to ensure is_arr_init(W, 0, 4*64))
+#[safety =
+   {
+    requires = is_arr_init(Hp, 0, 4*8) && is_arr_init(prefix, 0, PREFIXLEN) &&
+    is_arr_init(W, 0, idx_W) && 0 <= idx_W && idx_W <= 64 && 64 <= PREFIXLEN + idx_W,
+    ensures = is_arr_init(Hp, 0, 4*8) && is_arr_init(W, 0, 4*64) &&
+    is_arr_init(prefix, 0, PREFIXLEN) && 0 <= idx_W && idx_W <= 63
+   }
+ ]
+fn absorb_fixed(
+  reg ptr u32[8] Hp,
+  reg ptr u32[64] W,
+  reg u64 idx_W,
+  reg ptr u8[PREFIXLEN] prefix
+) -> reg ptr u32[8], reg ptr u32[64], reg u64 // -> Hp, W, idx_W
+{
+  reg u64 avail;
+  reg u64 in_ptr;
+  reg u64 in_len;
+  reg u64 target;
+
+  in_ptr = 0;
+  in_len = PREFIXLEN;
+  avail = 64;
+  avail -= idx_W;
+
+  // if enough prefix bytes are present, fill the current block and run the compression function once
+  if (in_len >= avail) {
+    // fill the rest of the block
+    while (idx_W < 64) {
+      W[:u8 idx_W] = prefix[in_ptr];
+      idx_W  += 1;
+      in_ptr += 1;
+    }
+
+    // run the compression function
+    () = #spill(prefix, in_ptr, in_len, avail);
+    Hp, W = compress(Hp, W);
+    () = #unspill(prefix, in_ptr, in_len, avail);
+
+    idx_W = 0;
+    in_len -= avail; // 'avail' number of bytes consumed
+  }
+
+  // if enough prefix bytes are present, process full blocks of prefix bytes
+  while (in_len >= 64) {
+    // fill the rest of the block
+    while (idx_W < 64) {
+      W[:u8 idx_W] = prefix[in_ptr];
+      idx_W  += 1;
+      in_ptr += 1;
+    }
+
+    // run the compression function
+    () = #spill(prefix, in_ptr, in_len);
+    Hp, W = compress(Hp, W);
+    () = #unspill(prefix, in_ptr, in_len);
+
+    idx_W = 0;
+    in_len -= 64; // 64 bytes consumed
+  }
+
+  // write the remainder of the prefix bytes to W and update idx_W
+  target = idx_W;
+  target += in_len;
+  while (idx_W < target) {
+    W[:u8 idx_W] = prefix[in_ptr];
+    idx_W  += 1;
+    in_ptr += 1;
+  }
+
+  return Hp, W, idx_W;
+}
+//_JogamesHD_ Every byte from Hp is read, so it must be fully initialized
+//_JogamesHD_ The function writes every byte in W from index idx_W to 63, so everything before that must be initialized
+//_JogamesHD_ The bound on idx_W prevents an oob array access.
+#[safety =
+   {
+    requires = is_arr_init(Hp, 0, 4*8) && is_arr_init(W, 0, idx_W) &&
+    0 <= idx_W && idx_W <= 4*64 - 1,
+    ensures = is_arr_init(Hp, 0, 4*8) && is_arr_init(W, 0, 4*64)
+   }
+ ]
+fn finish(
+  reg ptr u32[8] Hp,
+  reg ptr u32[64] W,
+  reg u64 idx_W,
+  reg u64 bits
+) -> reg ptr u32[8], reg ptr u32[64] // -> Hp, W // W is only returned because W needs to be writable
+{
+  () = #spill(bits); // only needed at the end of the function
+
+  // set separation byte after input to 0x80
+  W[:u8 idx_W] = 0x80;
+  idx_W += 1;
+
+  // if the separation byte topped off the block, run the compression function
+  if (idx_W == 64) {
+    Hp, W = compress(Hp, W);
+    idx_W = 0;
+  }
+
+  // check whether the length encoding fits in the current block
+  if (idx_W < 64-8) { // length encoding fits in the current block
+    // set the zero padding, leaving space for the length encoding
+    while (idx_W < 64-8) {
+      W[:u8 idx_W] = 0x00;
+      idx_W += 1;
+    }
+  } else { // length encoding does NOT fit in the current block
+    // fill the rest of the block with zero padding
+    while (idx_W < 64) {
+      W[:u8 idx_W] = 0x00;
+      idx_W += 1;
+    }
+
+    // run the compression function
+    Hp, W = compress(Hp, W);
+    idx_W = 0;
+    
+    // set more zero padding, leaving space for the length encoding
+    while (idx_W < 64-8) {
+      W[:u8 idx_W] = 0x00;
+      idx_W += 1;
+    }
+  }
+
+  () = #unspill(bits);
+
+  // set the length encoding
+  // length encoding is 64 bits = 8 bytes
+  idx_W = 63;
+  while(idx_W >= 64-8) {
+    W[:u8 idx_W] = (8u) bits;
+    bits >>= 8;
+    idx_W -= 1;
+  }
+  
+  // run the compression function
+  Hp, W = compress(Hp, W);
+
+  return Hp, W;
+}
+
+//_JogamesHD_ Every byte from prefix is read, so it must be fully initialized
+//_JogamesHD_ The bound on PREFIXLEN is derived from the bound in absorb_fixed
+//_JogamesHD_ The bounds on ctx_len and msg_len are necessary to guarantee the preconditions of absorb_pointer
+#[safety =
+   {
+    requires = is_arr_init(prefix, 0, PREFIXLEN) &&
+    64 <= PREFIXLEN && 64 <= ctx_len && 64 <= msg_len,
+    ensures = is_arr_init(out, 0, 32)
+   }
+ ]
+fn sha256_absorb(
+  reg ptr u8[32] out,
+  reg ptr u8[PREFIXLEN] prefix,
+  reg u64 ctx_ptr ctx_len,
+  reg u64 msg_ptr msg_len
+) -> reg ptr u8[32] // -> out
+{
+  () = #spill(out); // make space in the registers
+
+  reg ptr u32[8] Hp;
+  reg u64 bits;
+  reg u64 idx_W;
+
+  stack u32[8] H;
+  stack u32[64] W;
+
+  // compute number of message bits for the length encoding later
+  bits = PREFIXLEN;  // bytelength of the prefix
+  bits += ctx_len;   // bytelength of the context
+  bits += msg_len;   // bytelength of the message
+  bits += 2;         // account for the zero-byte and the context length
+  bits <<= 3;        // convert number of bytes to number of bits
+  () = #spill(bits); // make space in the registers
+
+  H = __initH_ref();
+  Hp = H;
+  
+  () = #spill(ctx_ptr, ctx_len, msg_ptr, msg_len); // make space in the registers
+  
+  idx_W = 0;
+
+  // absorb the fixed-sized prefix
+  Hp, W, idx_W = absorb_fixed(Hp, W, idx_W, prefix);
+  
+  // add a zero-padding byte (preceding the context length)
+  W[:u8 idx_W] = 0x00;
+  idx_W += 1;
+
+  // if the padding byte topped off the block, run the compression function
+  if (idx_W == 64) {
+    Hp, W = compress(Hp, W);
+    idx_W = 0;
+  }
+  
+  () = #unspill(ctx_len);
+
+  // add the context length
+  W[:u8 idx_W] = (8u) ctx_len;
+  idx_W += 1;
+
+  // if the context length topped off the block, run the compression function
+  if (idx_W == 64) {
+    Hp, W = compress(Hp, W);
+    idx_W = 0;
+  }
+
+  () = #unspill(ctx_ptr);
+
+  // absorb the variable-sized context
+  Hp, W, idx_W = absorb_pointer(Hp, W, idx_W, ctx_ptr, ctx_len);
+  
+  () = #unspill(msg_ptr, msg_len);
+
+  // absorb the variable-sized message
+  Hp, W, idx_W = absorb_pointer(Hp, W, idx_W, msg_ptr, msg_len);
+
+  () = #unspill(bits);
+  Hp, W = finish(Hp, W, idx_W, bits);
+
+  H = Hp;
+  () = #unspill(out);
+  out = __store_ref_array(out, H);
+  return out;
+}

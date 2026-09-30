@@ -1,0 +1,626 @@
+require "../adrs/adrs.jinc" // ADRS data structure
+
+// import the formosa-keccak SHAKE256 implementation
+from Keccak require "common/keccak1600_generic.jinc"
+from Keccak require "ref/select_bmi1.jinc"
+from Keccak require "ref/keccak1600.jinc"
+
+// import a SHAKE256 implementation in which it is possible to manually set the state,
+// so we can combine manually writer ptr reg arguments and the variable-sized reg u64
+// message and context strings
+require "shake256/keccak1600.jinc"
+
+// for single bytes
+namespace A_1 {
+    param int _ASIZE = 1;
+    from Keccak require "ref/keccak1600_fixedsizes_ASIZE.jinc"
+}
+
+// for separation byte and context length
+namespace A_2 {
+    param int _ASIZE = 2;
+    from Keccak require "ref/keccak1600_fixedsizes_ASIZE.jinc"
+}
+
+// for ADRS
+namespace A_32 {
+    param int _ASIZE = 32;
+    from Keccak require "ref/keccak1600_fixedsizes_ASIZE.jinc"
+}
+
+// for PK and SK elements, M_1, and output size of PRF, PRF_msg, F, H, T_len, and T_k
+namespace A_N {
+    param int _ASIZE = SPX_N;
+    from Keccak require "ref/keccak1600_fixedsizes_ASIZE.jinc"
+}
+
+// for output size of H_msg
+namespace A_M {
+    param int _ASIZE = SPX_M;
+    from Keccak require "ref/keccak1600_fixedsizes_ASIZE.jinc"
+}
+
+// for M_len
+namespace A_LENN {
+    param int _ASIZE = SPX_LEN*SPX_N;
+    from Keccak require "ref/keccak1600_fixedsizes_ASIZE.jinc"
+}
+
+// for M_k
+namespace A_KN {
+    param int _ASIZE = SPX_K*SPX_N;
+    from Keccak require "ref/keccak1600_fixedsizes_ASIZE.jinc"
+}
+
+inline
+fn __shake256_consider_permute(reg ptr u64[25] state, reg u64 offset) -> reg ptr u64[25], reg u64 {
+    if (offset >= SHAKE256_RATE) {
+        state = _keccakf1600_ref1(state);
+        offset = 0;
+    }
+    return state, offset;
+}
+
+// H_msg(R, PK.seed, PK.root, M) = SHAKE256(R || PK.seed || PK.root || M, 8*SPX_M)
+fn H_msg(
+    reg ptr u8[SPX_M] out,    // output: buffer the result gets written to
+    reg ptr u8[SPX_N] r,      // message randomiser
+    reg ptr u8[SPX_N] pkseed, // PK.seed
+    reg ptr u8[SPX_N] pkroot, // PK.root
+    reg u64 ctx_ptr,          // context pointer
+    reg u64 ctx_len,          // context length
+    reg u64 msg_ptr,          // message pointer
+    reg u64 msg_len           // message length
+) -> reg ptr u8[SPX_M] // -> out
+{
+    () = #spill(out); // only needed at the end of the function
+
+    () = #spill(ctx_ptr, ctx_len, msg_ptr, msg_len);
+    
+    // register variables
+    reg u256 copied_32_bytes;
+    reg u128 copied_16_bytes;
+    reg u64 state_offset;
+    reg u64 ctx_offset;
+    reg u64 msg_offset;
+    reg u8 byte;
+
+    // stack variables
+    stack u64[25] state; // internal state of SHAKE256
+
+    inline int i;
+
+    // initialise the SHAKE256 state
+    state = __keccak_init_ref1(state);
+    
+    if (SPX_N == 16) {
+        // absorb R, PK.seed, and PK.root
+        copied_16_bytes = r[:u128 0];
+        state.[:u128 0]  = copied_16_bytes;
+        copied_16_bytes = pkseed[:u128 0];
+        state.[:u128 16] = copied_16_bytes;
+        copied_16_bytes = pkroot[:u128 0];
+        state.[:u128 32] = copied_16_bytes;
+
+        // absorb 0 || ctx_len (part of the message/context encoding)
+        state.[:u8 48] = 0;
+        state.[:u8 49] = (8u) ctx_len;
+        state_offset = 50;
+    } else if (SPX_N == 24) {
+        // absorb R, PK.seed, and PK.root
+        for i=0 to 24 { state[:u8 i + 0 ] = r[i];      }
+        for i=0 to 24 { state[:u8 i + 24] = pkseed[i]; }
+        for i=0 to 24 { state[:u8 i + 48] = pkroot[i]; }
+
+        // absorb 0 || ctx_len (part of the message/context encoding)
+        state.[:u8 72] = 0;
+        state.[:u8 73] = (8u) ctx_len;
+        state_offset = 74;
+    } else if (SPX_N == 32) {
+        // absorb R, PK.seed, and PK.root
+        copied_32_bytes = r[:u256 0];
+        state.[:u256 0]  = copied_32_bytes;
+        copied_32_bytes = pkseed[:u256 0];
+        state.[:u256 32] = copied_32_bytes;
+        copied_32_bytes = pkroot[:u256 0];
+        state.[:u256 64] = copied_32_bytes;
+
+        // absorb 0 || ctx_len (part of the message/context encoding)
+        state.[:u8 96] = 0;
+        state.[:u8 97] = (8u) ctx_len;
+        state_offset = 98;
+    }
+
+    // absorb context string
+    ctx_offset = 0;
+    () = #unspill(ctx_ptr, ctx_len);
+    while(ctx_offset < ctx_len) {
+        if (state_offset >= SHAKE256_RATE) {
+            () = #spill(ctx_ptr, ctx_offset, ctx_len);
+            state = _keccakf1600_ref1(state);
+            () = #unspill(ctx_ptr, ctx_offset, ctx_len);
+
+            state_offset = 0;
+        }
+
+        byte = [:u8 ctx_ptr + ctx_offset];
+        ctx_offset += 1;
+
+        state[:u8 state_offset] ^= byte;
+        state_offset += 1;
+    }
+    
+    // absorb message string
+    msg_offset = 0;
+    () = #unspill(msg_ptr, msg_len);
+    while(msg_offset < msg_len) {
+        if (state_offset >= SHAKE256_RATE) {
+            () = #spill(msg_ptr, msg_offset, msg_len);
+            state = _keccakf1600_ref1(state);
+            () = #unspill(msg_ptr, msg_offset, msg_len);
+
+            state_offset = 0;
+        }
+
+        byte = [:u8 msg_ptr + msg_offset];
+        msg_offset += 1;
+
+        state[:u8 state_offset] ^= byte;
+        state_offset += 1;
+    }
+
+    // absorb separator byte
+    state, state_offset = __shake256_consider_permute(state, state_offset);
+    state[:u8 state_offset] ^= 0x1f;
+
+    // finalise state
+    state, _ = __shake256_consider_permute(state, state_offset);
+    state[:u8 SHAKE256_RATE-1] ^= 0x80;
+
+    state = _keccakf1600_ref1(state);
+
+    () = #unspill(out);
+    for i=0 to SPX_M {
+        byte = state[:u8 i];
+        out[i] = byte;
+    }
+    
+    return out;
+}
+
+inline // inline wrapper that splits parameter live-ranges, to aid the Jasmin compiler
+fn __H_msg(
+    reg ptr u8[SPX_M] out,    // output: buffer the result gets written to
+    reg ptr u8[SPX_N] r,      // message randomiser
+    reg ptr u8[SPX_N] pkseed, // PK.seed
+    reg ptr u8[SPX_N] pkroot, // PK.root
+    reg u64 ctx_ptr,          // context pointer
+    reg u64 ctx_len,          // context length
+    reg u64 msg_ptr,          // message pointer
+    reg u64 msg_len           // message length
+) -> reg ptr u8[SPX_M] // -> out
+{
+    // split live-range of the input parameters into two segments
+    out = out; r = r; pkseed = pkseed; pkroot = pkroot; ctx_ptr = ctx_ptr; ctx_len = ctx_len; msg_ptr = msg_ptr; msg_len = msg_len;
+
+    out = H_msg(out, r, pkseed, pkroot, ctx_ptr, ctx_len, msg_ptr, msg_len);
+
+    // split live-range of the output parameters into two segments
+    out = out;
+
+    return out;
+}
+
+// PRF_msg(SK.prf, optrand, M) = SHAKE256(SK.prf || optrand || M, 8*SPX_N)
+fn PRF_msg(
+    reg ptr u8[SPX_N] out,     // output: buffer the result gets written to
+    reg ptr u8[SPX_N] skprf,   // SK.prf
+    reg ptr u8[SPX_N] optrand, // (optional) additional randomness
+    reg u64 ctx_ptr,           // context pointer
+    reg u64 ctx_len,           // context length
+    reg u64 msg_ptr,           // message pointer
+    reg u64 msg_len            // message length
+) -> reg ptr u8[SPX_N] // -> out
+{
+    () = #spill(out); // only needed at the end of the function
+
+    () = #spill(ctx_ptr, ctx_len, msg_ptr, msg_len);
+    
+    // register variables
+    reg u256 copied_32_bytes;
+    reg u128 copied_16_bytes;
+    reg u64 state_offset;
+    reg u64 ctx_offset;
+    reg u64 msg_offset;
+    reg u8 byte;
+
+    // stack variables
+    stack u64[25] state; // internal state of SHAKE256
+
+    inline int i;
+
+    // initialise the SHAKE256 state
+    state = __keccak_init_ref1(state);
+
+    if (SPX_N == 16) {
+        // absorb SK.prf and opt_rand
+        copied_16_bytes = skprf[:u128 0];
+        state.[:u128 0] = copied_16_bytes;
+        copied_16_bytes = optrand[:u128 0];
+        state.[:u128 16] = copied_16_bytes;
+
+        // absorb 0 || ctx_len (part of the message/context encoding)
+        state.[:u8 32] = 0;
+        state.[:u8 33] = (8u) ctx_len;
+        state_offset = 34;
+    } else if (SPX_N == 24) {
+        // absorb R, PK.seed, and PK.root
+        for i=0 to 24 { state[:u8 i + 0 ] = skprf[i];   }
+        for i=0 to 24 { state[:u8 i + 24] = optrand[i]; }
+
+        // absorb 0 || ctx_len (part of the message/context encoding)
+        state.[:u8 48] = 0;
+        state.[:u8 49] = (8u) ctx_len;
+        state_offset = 50;
+    } else if (SPX_N == 32) {
+        // absorb SK.prf and opt_rand
+        copied_32_bytes = skprf[:u256 0];
+        state.[:u256 0] = copied_32_bytes;
+        copied_32_bytes = optrand[:u256 0];
+        state.[:u256 32] = copied_32_bytes;
+
+        // absorb 0 || ctx_len (part of the message/context encoding)
+        state.[:u8 64] = 0;
+        state.[:u8 65] = (8u) ctx_len;
+        state_offset = 66;
+    }
+
+    // absorb context string
+    ctx_offset = 0;
+    () = #unspill(ctx_ptr, ctx_len);
+    while(ctx_offset < ctx_len) {
+        if (state_offset >= SHAKE256_RATE) {
+            () = #spill(ctx_ptr, ctx_offset, ctx_len);
+            state = _keccakf1600_ref1(state);
+            () = #unspill(ctx_ptr, ctx_offset, ctx_len);
+
+            state_offset = 0;
+        }
+
+        byte = [:u8 ctx_ptr + ctx_offset];
+        ctx_offset += 1;
+
+        state[:u8 state_offset] ^= byte;
+        state_offset += 1;
+    }
+    
+    // absorb message string
+    msg_offset = 0;
+    () = #unspill(msg_ptr, msg_len);
+    while(msg_offset < msg_len) {
+        if (state_offset >= SHAKE256_RATE) {
+            () = #spill(msg_ptr, msg_offset, msg_len);
+            state = _keccakf1600_ref1(state);
+            () = #unspill(msg_ptr, msg_offset, msg_len);
+
+            state_offset = 0;
+        }
+
+        byte = [:u8 msg_ptr + msg_offset];
+        msg_offset += 1;
+
+        state[:u8 state_offset] ^= byte;
+        state_offset += 1;
+    }
+
+    // absorb separator byte
+    state, state_offset = __shake256_consider_permute(state, state_offset);
+    state[:u8 state_offset] ^= 0x1f;
+
+    // finalise state
+    state, _ = __shake256_consider_permute(state, state_offset);
+    state[:u8 SHAKE256_RATE-1] ^= 0x80;
+
+    state = _keccakf1600_ref1(state);
+
+    () = #unspill(out);
+    if (SPX_N == 16) {
+        copied_16_bytes = state.[:u128 0];
+        out.[:u128 0] = copied_16_bytes;
+    } else if (SPX_N == 24) {
+        for i=0 to 24 { out[i] = state[:u8 i]; }
+    } else if (SPX_N == 32) {
+        copied_32_bytes = state.[:u256 0];
+        out.[:u256 0] = copied_32_bytes;
+    }
+    
+    return out;
+}
+
+inline // inline wrapper that splits parameter live-ranges, to aid the Jasmin compiler
+fn __PRF_msg(
+    reg ptr u8[SPX_N] out,     // output: buffer the result gets written to
+    reg ptr u8[SPX_N] skprf,   // SK.prf
+    reg ptr u8[SPX_N] optrand, // (optional) additional randomness
+    reg u64 ctx_ptr,           // context pointer
+    reg u64 ctx_len,           // context length
+    reg u64 msg_ptr,           // message pointer
+    reg u64 msg_len            // message length
+) -> reg ptr u8[SPX_N] // -> out
+{
+    // split live-range of the input parameters into two segments
+    out = out; skprf = skprf; optrand = optrand; ctx_ptr = ctx_ptr; ctx_len = ctx_len; msg_ptr = msg_ptr; msg_len = msg_len;
+
+    out = PRF_msg(out, skprf, optrand, ctx_ptr, ctx_len, msg_ptr, msg_len);
+
+    // split live-range of the output parameters into two segments
+    out = out;
+
+    return out;
+}
+
+// PRF(PK.seed, SK.seed, ADRS) = SHAKE256(PK.seed || ADRS || SK.seed, 8*SPX_N)
+fn PRF(
+    reg ptr u8[SPX_N] out,    // output: buffer the result gets written to
+    reg ptr u8[SPX_N] pkseed, // PK.seed
+    reg ptr u8[SPX_N] skseed, // SK.seed
+    reg ptr u32[8] adrs       // ADRS
+) -> reg ptr u8[SPX_N] // -> out
+{
+    () = #spill(out); // only needed at the end of the function
+    
+    // register variables
+    reg ptr u64[25] st; // pointer to SHAKE256 state stack variable
+
+    // stack variables
+    stack u64[25] st_s; // internal state of SHAKE256
+    stack u8[32] adrs_bytes; // temporary variable for passing ADRS as a byte string
+
+    // SHAKE256 state initialisation
+    st = st_s;
+    st = __state_init_ref(st);
+    
+    // absorb all inputs
+    st, _ =  A_N::__absorb_ref(st, 0,        pkseed,     UNFINISHED, R136); // absorb PK.seed
+    adrs_bytes = __adrs_to_bytes(adrs_bytes, adrs);
+    st, _ = A_32::__absorb_ref(st, SPX_N,    adrs_bytes, UNFINISHED, R136); // absorb ADRS
+    st, _ =  A_N::__absorb_ref(st, SPX_N+32, skseed,     SHAKE,      R136); // absorb SK.seed
+
+    // squeeze to get the output
+    () = #unspill(out);
+    _, out = A_N::__squeeze_ref(st, out, R136);
+    
+    return out;
+}
+
+inline // inline wrapper that splits parameter live-ranges, to aid the Jasmin compiler
+fn __PRF(
+    reg ptr u8[SPX_N] out,    // output: buffer the result gets written to
+    reg ptr u8[SPX_N] pkseed, // PK.seed
+    reg ptr u8[SPX_N] skseed, // SK.seed
+    reg ptr u32[8] adrs       // ADRS
+) -> reg ptr u8[SPX_N] // -> out
+{
+    // split live-range of the input parameters into two segments
+    out = out; pkseed = pkseed; skseed = skseed; adrs = adrs;
+
+    out = PRF(out, pkseed, skseed, adrs);
+
+    // split live-range of the output parameters into two segments
+    out = out;
+
+    return out;
+}
+
+// F(PK.seed, ADRS, M_1) = SHAKE256(PK.seed || ADRS || M_1, 8*SPX_N)
+fn F(
+    reg ptr u8[SPX_N] out,    // both input and output (F is in-place)
+    reg ptr u8[SPX_N] pkseed, // PK.seed
+    reg ptr u32[8] adrs       // ADRS
+) -> reg ptr u8[SPX_N] // -> out
+{
+    () = #spill(out); // only needed at the end of the function
+    
+    // register variables
+    reg ptr u64[25] st; // pointer to SHAKE256 state stack variable
+
+    // stack variables
+    stack u64[25] st_s; // internal state of SHAKE256
+    stack u8[32] adrs_bytes; // temporary variable for passing ADRS as a byte string
+
+    // SHAKE256 state initialisation
+    st = st_s;
+    st = __state_init_ref(st);
+    
+    // absorb all inputs
+    st, _ =  A_N::__absorb_ref(st, 0,        pkseed,     UNFINISHED, R136); // absorb PK.seed
+    adrs_bytes = __adrs_to_bytes(adrs_bytes, adrs);
+    st, _ = A_32::__absorb_ref(st, SPX_N,    adrs_bytes, UNFINISHED, R136); // absorb ADRS
+    st, _ =  A_N::__absorb_ref(st, SPX_N+32, out,        SHAKE,      R136); // absorb M_1
+
+    // squeeze to get the output
+    () = #unspill(out);
+    _, out = A_N::__squeeze_ref(st, out, R136);
+    
+    return out;
+}
+
+inline // inline wrapper that splits parameter live-ranges, to aid the Jasmin compiler
+fn __F(
+    reg ptr u8[SPX_N] out,    // both input and output (F is in-place)
+    reg ptr u8[SPX_N] pkseed, // PK.seed
+    reg ptr u32[8] adrs       // ADRS
+) -> reg ptr u8[SPX_N] // -> out
+{
+    // split live-range of the input parameters into two segments
+    out = out; pkseed = pkseed; adrs = adrs;
+
+    out = F(out, pkseed, adrs);
+
+    // split live-range of the output parameters into two segments
+    out = out;
+
+    return out;
+}
+
+// H(PK.seed, ADRS, M_2) = SHAKE256(PK.seed || ADRS || M_2, 8*SPX_N)
+fn H(
+    reg ptr u8[SPX_N] out,    // output: buffer the result gets written to
+    reg ptr u8[SPX_N] pkseed, // PK.seed
+    reg ptr u32[8] adrs,      // ADRS
+    reg ptr u8[SPX_N] in1,    // first part of the concatenation
+    reg ptr u8[SPX_N] in2     // second part of the concatenation
+) -> reg ptr u8[SPX_N] // -> out
+{
+    () = #spill(out); // only needed at the end of the function
+    
+    // register variables
+    reg ptr u64[25] st; // pointer to SHAKE256 state stack variable
+
+    // stack variables
+    stack u64[25] st_s; // internal state of SHAKE256
+    stack u8[32] adrs_bytes; // temporary variable for passing ADRS as a byte string
+
+    // SHAKE256 state initialisation
+    st = st_s;
+    st = __state_init_ref(st);
+    
+    // absorb all inputs
+    st, _ =  A_N::__absorb_ref(st, 0,          pkseed,     UNFINISHED, R136); // absorb PK.seed
+    adrs_bytes = __adrs_to_bytes(adrs_bytes, adrs);
+    st, _ = A_32::__absorb_ref(st, SPX_N,      adrs_bytes, UNFINISHED, R136); // absorb ADRS
+    st, _ =  A_N::__absorb_ref(st, SPX_N+32,   in1,        UNFINISHED, R136); // absorb M_2
+    st, _ =  A_N::__absorb_ref(st, 2*SPX_N+32, in2,        SHAKE,      R136); // absorb M_2
+
+    // squeeze to get the output
+    () = #unspill(out);
+    _, out = A_N::__squeeze_ref(st, out, R136);
+    
+    return out;
+}
+
+inline // inline wrapper that splits parameter live-ranges, to aid the Jasmin compiler
+fn __H(
+    reg ptr u8[SPX_N] out,    // output: buffer the result gets written to
+    reg ptr u8[SPX_N] pkseed, // PK.seed
+    reg ptr u32[8] adrs,      // ADRS
+    reg ptr u8[SPX_N] in1,    // first part of the concatenation
+    reg ptr u8[SPX_N] in2     // second part of the concatenation
+) -> reg ptr u8[SPX_N] // -> out
+{
+    // split live-range of the input parameters into two segments
+    out = out; pkseed = pkseed; adrs = adrs; in1 = in1; in2 = in2;
+
+    out = H(out, pkseed, adrs, in1, in2);
+
+    // split live-range of the output parameters into two segments
+    out = out;
+
+    return out;
+}
+
+// T_len(PK.seed, ADRS, M_len) = SHAKE256(PK.seed || ADRS || M_len, 8*SPX_N)
+fn T_len(
+    reg ptr u8[SPX_N] out,           // output: buffer the result gets written to
+    reg ptr u8[SPX_N] pkseed,        // PK.seed
+    reg ptr u32[8] adrs,             // ADRS
+    reg ptr u8[SPX_LEN*SPX_N] chains // concatenation of all chain end values in a WOTS instance
+) -> reg ptr u8[SPX_N] // -> out
+{
+    () = #spill(out); // only needed at the end of the function
+    
+    // register variables
+    reg ptr u64[25] st; // pointer to SHAKE256 state stack variable
+
+    // stack variables
+    stack u64[25] st_s; // internal state of SHAKE256
+    stack u8[32] adrs_bytes; // temporary variable for passing ADRS as a byte string
+
+    // SHAKE256 state initialisation
+    st = st_s;
+    st = __state_init_ref(st);
+    
+    // absorb all inputs
+    st, _ =    A_N::__absorb_ref(st, 0,        pkseed,     UNFINISHED, R136); // absorb PK.seed
+    adrs_bytes = __adrs_to_bytes(adrs_bytes, adrs);
+    st, _ =   A_32::__absorb_ref(st, SPX_N,    adrs_bytes, UNFINISHED, R136); // absorb ADRS
+    st, _ = A_LENN::__absorb_ref(st, SPX_N+32, chains,     SHAKE,      R136); // absorb M_len
+
+    // squeeze to get the output
+    () = #unspill(out);
+    _, out = A_N::__squeeze_ref(st, out, R136);
+    
+    return out;
+}
+
+inline // inline wrapper that splits parameter live-ranges, to aid the Jasmin compiler
+fn __T_len(
+    reg ptr u8[SPX_N] out,           // output: buffer the result gets written to
+    reg ptr u8[SPX_N] pkseed,        // PK.seed
+    reg ptr u32[8] adrs,             // ADRS
+    reg ptr u8[SPX_LEN*SPX_N] chains // concatenation of all chain end values in a WOTS instance
+) -> reg ptr u8[SPX_N] // -> out
+{
+    // split live-range of the input parameters into two segments
+    out = out; pkseed = pkseed; adrs = adrs; chains = chains;
+
+    out = T_len(out, pkseed, adrs, chains);
+
+    // split live-range of the output parameters into two segments
+    out = out;
+
+    return out;
+}
+
+// T_k(PK.seed, ADRS, M_k) = SHAKE256(PK.seed || ADRS || M_k, 8*SPX_N)
+fn T_k(
+    reg ptr u8[SPX_N] out,        // output: buffer the result gets written to
+    reg ptr u8[SPX_N] pkseed,     // PK.seed
+    reg ptr u32[8] adrs,          // ADRS
+    reg ptr u8[SPX_K*SPX_N] roots // concatenation of all roots in a FORS forest
+) -> reg ptr u8[SPX_N] // -> out
+{
+    () = #spill(out); // only needed at the end of the function
+    
+    // register variables
+    reg ptr u64[25] st; // pointer to SHAKE256 state stack variable
+
+    // stack variables
+    stack u64[25] st_s; // internal state of SHAKE256
+    stack u8[32] adrs_bytes; // temporary variable for passing ADRS as a byte string
+
+    // SHAKE256 state initialisation
+    st = st_s;
+    st = __state_init_ref(st);
+    
+    // absorb all inputs
+    st, _ =  A_N::__absorb_ref(st, 0,        pkseed,     UNFINISHED, R136); // absorb PK.seed
+    adrs_bytes = __adrs_to_bytes(adrs_bytes, adrs);
+    st, _ = A_32::__absorb_ref(st, SPX_N,    adrs_bytes, UNFINISHED, R136); // absorb ADRS
+    st, _ = A_KN::__absorb_ref(st, SPX_N+32, roots,      SHAKE,      R136); // absorb M_k
+
+    // squeeze to get the output
+    () = #unspill(out);
+    _, out = A_N::__squeeze_ref(st, out, R136);
+    
+    return out;
+}
+
+inline // inline wrapper that splits parameter live-ranges, to aid the Jasmin compiler
+fn __T_k(
+    reg ptr u8[SPX_N] out,        // output: buffer the result gets written to
+    reg ptr u8[SPX_N] pkseed,     // PK.seed
+    reg ptr u32[8] adrs,          // ADRS
+    reg ptr u8[SPX_K*SPX_N] roots // concatenation of all roots in a FORS forest
+) -> reg ptr u8[SPX_N] // -> out
+{
+    // split live-range of the input parameters into two segments
+    out = out; pkseed = pkseed; adrs = adrs; roots = roots;
+
+    out = T_k(out, pkseed, adrs, roots);
+
+    // split live-range of the output parameters into two segments
+    out = out;
+
+    return out;
+}

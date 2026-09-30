@@ -1,0 +1,262 @@
+
+/////////////////////// HELPER FUNCTIONS ///////////////////////
+
+// update indices:
+// -> idx_leaf = idx_tree mod 2^h'
+// -> idx_tree >>= h'
+inline
+fn __ht_update_idx(
+    reg u32        idx_leaf, // index of the leaf within the XMSS tree to sign with
+    reg ptr u32[3] idx_tree  // index of the tree within the layer of XMSS trees
+) -> reg u32, reg ptr u32[3] // -> idx_leaf, idx_tree
+{
+    // register variables
+    reg u32 high; // temporary variable for bitshifting
+
+    // idx_leaf = idx_tree mod 2^h':
+    // just taking idx_leaf = idx_tree[2] % 2^SPX_H_PRIME is fine only if SPX_H_PRIME <= 32
+    // (which is the case in all approved parameter sets in the SLH-DSS)
+    idx_leaf = idx_tree[2];             // take the least-significant 32 bits from idx_tree
+    idx_leaf &= (1 << SPX_H_PRIME) - 1; // idx_leaf mod 2^SPX_H_PRIME
+
+    // idx_tree >>= SPX_H_PRIME, one byte at a time:
+
+    // update idx_tree[2]
+    idx_tree[2] >>= SPX_H_PRIME; // shift the reference word right by h' bits
+    high = idx_tree[1];          // copy the word to the left
+    high <<= 32-SPX_H_PRIME;     // take the rightmost bits of that word
+    idx_tree[2] |= high;         // insert those rightmost bits into the reference word
+
+    // update idx_tree[1]
+    idx_tree[1] >>= SPX_H_PRIME; // shift the reference word right by h' bits
+    high = idx_tree[0];          // copy the word to the left
+    high <<= 32-SPX_H_PRIME;     // take the rightmost bits of that word
+    idx_tree[1] |= high;         // insert those rightmost bits into the reference word
+
+    // update idx_tree[0]
+    idx_tree[0] >>= SPX_H_PRIME; // shift the reference word right by h' bits
+
+    return idx_leaf, idx_tree;
+}
+
+//////////////////////// MAIN FUNCTIONS ////////////////////////
+
+/*-------------------------------------------------------------+
+| ALGORITHM 12 FROM SLH-DSS (FIPS 205)                         |
+| Generates a hypertree signature.                             |
++-------------------------------------------------------------*/
+fn ht_sign(
+    reg ptr u8[HT_SIG] sig_ht, // output: HT signature
+    reg ptr u8[SPX_N] pk_fors, // message to sign (FORS public key)
+    reg ptr u8[SPX_N] skseed,  // SK.seed: secret seed
+    reg ptr u8[SPX_N] pkseed,  // PK.seed: public seed
+    reg ptr u32[3] tree,       // lowest-layer XMSS tree index
+    reg u32        leaf        // XMSS tree leaf index
+) -> reg ptr u8[HT_SIG] // -> sig_ht
+{
+    // stack variables
+    stack u8[SPX_N] root;      // root of the current XMSS tree
+    stack u8[SPX_N] root_prev; // root of the previous XMSS tree
+    stack u32[8] adrs;         // ADRS data structure
+    stack u32[3] idx_tree;     // tree index selecting an XMSS tree to sign with
+
+    // register variables
+    reg ptr u8[XMSS_SIG] sig_xmss; // one XMSS part of the signature
+    reg u64 offset;   // byte offset within the hypertree signature
+    reg u32 idx_leaf; // leaf index selecting a leaf within an XMSS tree to sign with
+    reg u32 j;        // layer iterator
+
+    inline int i;
+
+    // copy the given tree and leaf indices
+    idx_leaf = leaf;
+    for i=0 to 3 { idx_tree[i] = tree[i]; }
+
+    // initialise ADRS with the tree index
+    adrs = __adrs_init(adrs);
+    adrs = __adrs_set_tree_addr(adrs, idx_tree);
+
+    // compute the lowest-layer XMSS signature on the FORS public key
+    sig_xmss = sig_ht[0 : XMSS_SIG]; // get the pointer to the subarray so the full array can be spilled
+    () = #spill(sig_ht, skseed, pkseed, pk_fors, idx_leaf);
+    sig_xmss, adrs = __xmss_sign(sig_xmss, pk_fors, skseed, idx_leaf, pkseed, adrs);
+    () = #unspill(sig_ht, skseed, pkseed, pk_fors, idx_leaf);
+    sig_ht[0 : XMSS_SIG] = sig_xmss; // redesignate the pointer so the region of the full array is not partial
+
+    // compute the lowest-layer XMSS tree root based on the first XMSS signature
+    () = #spill(skseed, pkseed, sig_ht);
+    root, adrs = __xmss_pkfromsig(root, idx_leaf, sig_xmss, pk_fors, pkseed, adrs);
+    () = #unspill(skseed, pkseed, sig_ht);
+
+    // iteratively compute the XMSS signatures that sign the root of the previous XMSS tree
+    offset = XMSS_SIG; // next signature will get placed immediately adjoining the previous one
+    j = 1; // layer zero signature has already been made, so start at layer one
+    while (j < SPX_D) {
+        () = #spill(skseed);
+
+        // update indices:
+        // -> idx_leaf = idx_tree mod 2^h'
+        // -> idx_tree >>= h'
+        idx_leaf, idx_tree = __ht_update_idx(idx_leaf, idx_tree);
+
+        // set the current layer and tree addresses in ADRS
+        adrs = __adrs_set_layer_addr(adrs, j);
+        adrs = __adrs_set_tree_addr(adrs, idx_tree);
+
+        // copy the root of the previous XMSS tree
+        root_prev = __copy_nbytes(root_prev, root);
+
+        // compute the XMSS signature on the previous XMSS tree's root
+        sig_xmss = sig_ht[offset : XMSS_SIG]; // get the pointer to the subarray so the full array can be spilled
+        () = #spill(sig_ht, pkseed, j, offset, idx_leaf);
+        sig_xmss, adrs = __xmss_sign(sig_xmss, root_prev, skseed, idx_leaf, pkseed, adrs);
+        () = #unspill(sig_ht, pkseed, j, offset, idx_leaf);
+        sig_ht[offset : XMSS_SIG] = sig_xmss; // redesignate the pointer so the region of the full array is not partial
+
+        // compute the current XMSS tree's root, unless it's the topmost layer
+        // in which case the root will be PK.root (which is not part of the signature)
+        if (j < SPX_D-1) {
+            () = #spill(pkseed, sig_ht, j, offset);
+            root, adrs = __xmss_pkfromsig(root, idx_leaf, sig_xmss, root_prev, pkseed, adrs);
+            () = #unspill(pkseed, sig_ht, j, offset);
+        }
+
+        () = #unspill(skseed);
+
+        offset += XMSS_SIG; // next signature will get placed immediately adjoining the previous one
+        j += 1; // advance to the next layer
+    }
+
+    return sig_ht;
+}
+
+inline // inline wrapper that splits parameter live-ranges, to aid the Jasmin compiler
+fn __ht_sign(
+    reg ptr u8[HT_SIG] sig_ht, // output: HT signature
+    reg ptr u8[SPX_N] pk_fors, // message to sign (FORS public key)
+    reg ptr u8[SPX_N] skseed,  // SK.seed: secret seed
+    reg ptr u8[SPX_N] pkseed,  // PK.seed: public seed
+    reg ptr u32[3] tree,       // lowest-layer XMSS tree index
+    reg u32        leaf        // XMSS tree leaf index
+) -> reg ptr u8[HT_SIG] // -> sig_ht
+{
+    // split live-range of the input parameters into two segments
+    sig_ht = sig_ht; pk_fors = pk_fors; skseed = skseed; pkseed = pkseed; tree = tree; leaf = leaf;
+
+    sig_ht = ht_sign(sig_ht, pk_fors, skseed, pkseed, tree, leaf);
+
+    // split live-range of the output parameters into two segments
+    sig_ht = sig_ht;
+
+    return sig_ht;
+}
+
+/*-------------------------------------------------------------+
+| ALGORITHM 13 FROM SLH-DSS (FIPS 205)                         |
+| Verifies a hypertree signature.                              |
++-------------------------------------------------------------*/
+fn ht_verify(
+    reg ptr u8[SPX_N] pk_fors, // message to verify signature on (FORS public key)
+    reg ptr u8[HT_SIG] sig_ht, // HT signature
+    reg ptr u8[SPX_N] pkseed,  // PK.seed: public seed
+    reg ptr u32[3] tree,       // lowest-layer XMSS tree index
+    reg u32        leaf,       // XMSS tree leaf index
+    reg ptr u8[SPX_N] pkroot   // PK.root: hypertree root
+) -> reg u64 // -> Boolean whether the HT signature is correct w.r.t. PK.root
+{
+    () = #spill(pkroot); // not needed until at the end of the function
+
+    // stack variables
+    stack u8[SPX_N] root;      // root of the current XMSS tree
+    stack u8[SPX_N] root_prev; // root of the previous XMSS tree
+    stack u32[8] adrs;         // ADRS data structure
+    stack u32[3] idx_tree;     // tree index selecting an XMSS tree to sign with
+
+    // register variables
+    reg ptr u8[XMSS_SIG] sig_xmss; // one XMSS part of the signature
+    reg u64 offset;   // byte offset within the hypertree signature
+    reg u64 res;      // indicates whether running this function was successful
+    reg u8  res_u8;   // temporary variable for casting purposes
+    reg u32 idx_leaf; // leaf index selecting a leaf within an XMSS tree to sign with
+    reg u32 j;        // layer iterator
+
+    inline int i;
+
+    // copy the given tree and leaf indices
+    idx_leaf = leaf;
+    for i=0 to 3 { idx_tree[i] = tree[i]; }
+
+    // initialise ADRS with the tree index
+    adrs = __adrs_init(adrs);
+    adrs = __adrs_set_tree_addr(adrs, idx_tree);
+
+    // extract the first XMSS signature from the hypertree signature
+    sig_xmss = sig_ht[0 : XMSS_SIG]; // get the pointer to the subarray so the full array can be spilled
+
+    // compute the lowest-layer XMSS tree root based on the first XMSS signature
+    () = #spill(pkseed, sig_ht);
+    root, adrs = __xmss_pkfromsig(root, idx_leaf, sig_xmss, pk_fors, pkseed, adrs);
+    () = #unspill(pkseed, sig_ht);
+
+    // iteratively compute the XMSS tree roots based on the XMSS signatures
+    offset = XMSS_SIG; // next signature is immediately adjoining the previous one
+    j = 1; // layer zero signature has already been made, so start at layer one
+    while (j < SPX_D) {
+        () = #spill(j, offset);
+
+        // update indices:
+        // -> idx_leaf = idx_tree mod 2^h'
+        // -> idx_tree >>= h'
+        idx_leaf, idx_tree = __ht_update_idx(idx_leaf, idx_tree);
+
+        // set the current layer and tree addresses in ADRS
+        adrs = __adrs_set_layer_addr(adrs, j);
+        adrs = __adrs_set_tree_addr(adrs, idx_tree);
+
+        // copy the root of the previous XMSS tree
+        root_prev = __copy_nbytes(root_prev, root);
+
+        // extract the XMSS signature on the previous XMSS tree's root
+        sig_xmss = sig_ht[offset : XMSS_SIG]; // get the pointer to the subarray so the full array can be spilled
+
+        // compute the current XMSS tree's root
+        () = #spill(pkseed, sig_ht);
+        root, adrs = __xmss_pkfromsig(root, idx_leaf, sig_xmss, root_prev, pkseed, adrs);
+        () = #unspill(pkseed, sig_ht);
+
+        () = #unspill(j, offset);
+
+        offset += XMSS_SIG; // next signature is immediately adjoining the previous one
+        j += 1; // advance to the next layer
+    }
+
+    () = #unspill(pkroot);
+
+    // compare the computed hypertree root and the claimed PK.root
+    res_u8 = __memcmp(pkroot, root);
+    res = (64u) res_u8;
+
+    return res;
+}
+
+inline // inline wrapper that splits parameter live-ranges, to aid the Jasmin compiler
+fn __ht_verify(
+    reg ptr u8[SPX_N] pk_fors, // message to verify signature on (FORS public key)
+    reg ptr u8[HT_SIG] sig_ht, // HT signature
+    reg ptr u8[SPX_N] pkseed,  // PK.seed: public seed
+    reg ptr u32[3] tree,       // lowest-layer XMSS tree index
+    reg u32        leaf,       // XMSS tree leaf index
+    reg ptr u8[SPX_N] pkroot   // PK.root: hypertree root
+) -> reg u64 // -> Boolean whether the HT signature is correct w.r.t. PK.root
+{
+    // split live-range of the input parameters into two segments
+    pk_fors = pk_fors; sig_ht = sig_ht; pkseed = pkseed; tree = tree; leaf = leaf; pkroot = pkroot;
+
+    reg u64 res;
+    res = ht_verify(pk_fors, sig_ht, pkseed, tree, leaf, pkroot);
+
+    // split live-range of the output parameters into two segments
+    res = res;
+
+    return res;
+}

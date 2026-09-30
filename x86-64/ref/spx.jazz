@@ -1,0 +1,106 @@
+require "active_params.jinc" // SPHINCS+ parameters
+// active_params.jinc in turn requires the chosen parameter file with the concrete parameter values
+
+require "stdlib/memcpy/memcpy.jinc" // for copying SPX_N-byte strings
+require "stdlib/memcmp/memcmp.jinc" // for comparing SPX_N-byte strings
+
+require "adrs/adrs.jinc" // ADRS data structure
+
+require "spx/spx.jinc"   // algorithms 18-20 of SLH-DSS: Stateless Practical Hash-based Incredibly Nice Cryptographic Signature Plus
+
+/*-------------------------------------------------------------+
+| ALGORITHM 21 FROM SLH-DSS (FIPS 205)                         |
+| Generates an SLH-DSA key pair.                               |
+| Generates the randomness needed for slh_keygen_internal      |
+| using the #randombytes hook.                                 |
++-------------------------------------------------------------*/
+export // this function is visible to the outside after compilation
+fn slh_keygen(
+    reg ptr u8[SPX_SKBYTES] sk, // out: secret key
+    reg ptr u8[SPX_PKBYTES] pk  // out: public key
+) -> reg ptr u8[SPX_SKBYTES], reg ptr u8[SPX_PKBYTES], reg u64 // -> sk, pk, res
+{
+    // register variables
+    reg u64 res; // indicates whether running this function was successful
+
+    // stack variables
+    stack u8[3*SPX_N] keyrnd; // key randomness
+
+    // generate random bytes for SK.seed, SK.prf, and PK.seed
+    () = #spill(sk, pk); // resolves architectural constraints compile error
+    keyrnd = #randombytes(keyrnd);
+    () = #unspill(sk, pk);
+
+    // set SK.seed, SK.prf, and PK.seed based on the random bytes
+    // compute PK.root based on SK.seed, SK.prf, and PK.seed
+    sk, pk, res = __slh_keygen_internal(sk, pk, keyrnd);
+
+    return sk, pk, res;
+}
+
+/*-------------------------------------------------------------+
+| ALGORITHM 22 FROM SLH-DSS (FIPS 205)                         |
+| Generates a pure SLH-DSA signature.                          |
+| Generates the randomness needed for slh_sign_internal using  |
+| the #randombytes hook.                                       |
++-------------------------------------------------------------*/
+export // this function is visible to the outside after compilation
+fn slh_sign(
+    reg ptr u8[SPX_SIG] sig_slh, // out: SPHINCS+ signature
+    reg ptr u64[2] ctx_msg_ptrs, // context and message pointers
+    reg ptr u64[2] ctx_msg_lens, // context and message lengths
+    reg ptr u8[SPX_SKBYTES] sk,  // secret key
+    reg u8 deterministic         // Boolean whether to use opt_rand = PK.seed (else opt_rand = randombytes)
+) -> reg ptr u8[SPX_SIG], reg u64 // -> sig_slh, res
+{
+    // register variables
+    reg u64 res; // indicates whether running this function was successful
+
+    // stack variables
+    stack u8[SPX_N] addrnd; // additional message randomness
+
+    if (deterministic == 0) { // deterministic additional randomness
+        //  substitute opt_rand <- PK.seed for the deterministic variant (according to line 2 in algorithm 19 in SLH-DSS)
+        addrnd = __copy_nbytes(addrnd, sk[2*SPX_N : SPX_N]);
+    } else { // non-deterministic additional randomness
+        () = #spill(sig_slh, ctx_msg_ptrs, ctx_msg_lens, sk); // resolves architectural constraints compile error
+        addrnd = #randombytes(addrnd);
+        () = #unspill(sig_slh, ctx_msg_ptrs, ctx_msg_lens, sk);
+    }
+
+    // ensure that the context length is valid
+    if (ctx_msg_lens[0] <= 255) {
+        // compute the SLH-DSA signature
+        sig_slh, res = __slh_sign_internal(sig_slh, ctx_msg_ptrs, ctx_msg_lens, sk, addrnd);
+    } else {
+        res = -1; // set return value to -1 (error)
+    }
+
+    return sig_slh, res;
+}
+
+/*-------------------------------------------------------------+
+| ALGORITHM 24 FROM SLH-DSS (FIPS 205)                         |
+| Verifies a pure SLH-DSA signature.                           |
++-------------------------------------------------------------*/
+export // this function is visible to the outside after compilation
+fn slh_verify(
+    reg ptr u64[2] ctx_msg_ptrs, // context and message pointers
+    reg ptr u64[2] ctx_msg_lens, // context and message lengths
+    reg ptr u8[SPX_SIG] sig,     // SPHINCS+ signature
+    reg ptr u8[SPX_PKBYTES] pk   // public key
+) -> reg u64 // -> res
+{
+    // register variables
+    reg u64 res; // indicates whether running this function was successful
+
+    // ensure that the context length is valid
+    if (ctx_msg_lens[0] <= 255) {
+        // verify the SLH-DSA signature
+        res = __slh_verify_internal(ctx_msg_ptrs, ctx_msg_lens, sig, pk);
+    } else {
+        res = -1; // set return value to -1 (error)
+    }
+
+    return res;
+}

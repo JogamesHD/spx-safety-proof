@@ -1,0 +1,24 @@
+inline
+fn __copy_nbytes (reg ptr u8[SPX_N] out in) -> reg ptr u8[SPX_N] {
+    inline int i;
+
+    if (SPX_N == 16) {
+        // This has to use unaligned accesses. Otherwise we get a 
+        // "variable allocation: bad range alignment" error
+
+        out.[:u64 0 * 8] = in.[:u64 0 * 8]; // copies in[0..7]
+        out.[:u64 1 * 8] = in.[:u64 1 * 8]; // copies in[8..15]
+    } else if (SPX_N == 32) {
+        // This has to use unaligned accesses. Otherwise we get a 
+        // "variable allocation: bad range alignment" error
+
+        out.[:u64 0 * 8] = in.[:u64 0 * 8]; // copies in[0..7]
+        out.[:u64 1 * 8] = in.[:u64 1 * 8]; // copies in[8..15]
+        out.[:u64 2 * 8] = in.[:u64 2 * 8]; // copies in[16..23]
+        out.[:u64 3 * 8] = in.[:u64 3 * 8]; // copies in[24..31]
+    } else {
+        for i=0 to SPX_N { out[i] = in[i]; }
+    }
+
+    return out;
+}
